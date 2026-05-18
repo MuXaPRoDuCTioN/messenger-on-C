@@ -3,8 +3,8 @@ CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic -g \
            -I./common -I./server -I./client
 LDFLAGS = -lpthread
 
-# SQLite и ncurses добавятся на этапах 3 и 7:
-# LDFLAGS += -lsqlite3
+# SQLite подключён на этапе 3; ncurses добавим на этапе 7:
+LDFLAGS += -lsqlite3
 # LDFLAGS += -lncurses
 
 SRV_SRCS = server/main.c server/network.c server/db.c

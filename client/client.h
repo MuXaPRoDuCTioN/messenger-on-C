@@ -6,8 +6,9 @@
 
 /* Состояние клиентского приложения */
 typedef struct {
-    int             server_fd;          /* Сокет соединения с сервером */
-    FILE           *stream;            /* Буферизованный поток */
+    int             server_fd;
+    FILE           *stream;       /* только запись — net_send_cmd */
+    FILE           *read_stream;  /* только чтение — net_recv_thread */
     char            my_login[MAX_LOGIN];
     int             active_chat_id;    /* Текущий открытый чат */
     int             connected;         /* 1 — онлайн, 0 — оффлайн */

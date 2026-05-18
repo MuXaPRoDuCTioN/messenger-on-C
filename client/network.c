@@ -40,8 +40,20 @@ int net_connect(const char *host, int port)
     }
 
     g_app.server_fd = fd;
-    g_app.stream    = fdopen(fd, "r+");
-    if (!g_app.stream) {
+
+    /* Два отдельных потока на один сокет:
+     * write_stream — только для отправки (net_send_cmd)
+     * read_stream  — только для чтения  (net_recv_thread)
+     * Без dup() один поток мешает другому при одновременном доступе */
+    int fd_dup = dup(fd);
+    if (fd_dup < 0) {
+        perror("dup");
+        close(fd);
+        return -1;
+    }
+    g_app.stream      = fdopen(fd,     "w");  /* запись */
+    g_app.read_stream = fdopen(fd_dup, "r");  /* чтение */
+    if (!g_app.stream || !g_app.read_stream) {
         perror("fdopen");
         close(fd);
         return -1;
@@ -68,7 +80,7 @@ void net_send_cmd(const char *cmd)
 
     pthread_mutex_lock(&g_app.msg_mutex);
     fprintf(g_app.stream, "%s\n", cmd);
-    fflush(g_app.stream);
+    fflush(g_app.stream);  /* Критично: без этого строка остаётся в буфере */
     pthread_mutex_unlock(&g_app.msg_mutex);
 }
 
@@ -80,7 +92,7 @@ void *net_recv_thread(void *arg)
     (void)arg;
     char buf[BUF_SIZE];
 
-    while (g_app.connected && fgets(buf, sizeof(buf), g_app.stream)) {
+    while (g_app.connected && fgets(buf, sizeof(buf), g_app.read_stream)) {
         size_t len = strlen(buf);
         if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
 

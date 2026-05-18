@@ -10,6 +10,7 @@
 AppState g_app = {
     .server_fd      = -1,
     .stream         = NULL,
+    .read_stream    = NULL,
     .my_login       = "",
     .active_chat_id = 0,
     .connected      = 0,
@@ -38,7 +39,7 @@ int main(int argc, char *argv[])
     /* TODO (этап 7): заменить на ui_init() + ui_run() */
     /* Пока — простой консольный ввод для проверки соединения */
     char line[BUF_SIZE];
-    while (printf("> "), fgets(line, sizeof(line), stdin)) {
+    while (printf("> "), fflush(stdout), fgets(line, sizeof(line), stdin)) {
         size_t len = strlen(line);
         if (len > 0 && line[len - 1] == '\n') line[len - 1] = '\0';
         if (strlen(line) == 0) continue;

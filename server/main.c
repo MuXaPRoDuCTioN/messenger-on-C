@@ -21,7 +21,11 @@ int main(int argc, char *argv[])
     int port = PORT_DEFAULT;
     if (argc > 1) port = atoi(argv[1]);
 
-    /* TODO (этап 3): db_open("server.db"); */
+    /* Открываем базу данных */
+    if (db_open("server.db") != 0) {
+        fprintf(stderr, "Ошибка инициализации базы данных\n");
+        return 1;
+    }
 
     int listen_fd = net_listen(port);
     if (listen_fd < 0) {

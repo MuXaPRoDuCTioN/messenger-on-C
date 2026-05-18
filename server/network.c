@@ -11,6 +11,112 @@
 
 #include "network.h"
 #include "server.h"
+#include "db.h"
+
+/* =========================================================
+ * parse_field — извлечь значение поля из строки протокола
+ * Формат: ТИП|ключ=значение|ключ=значение
+ * Пишет результат в out (размер out_size), возвращает 1 если нашёл
+ * ========================================================= */
+static int parse_field(const char *msg, const char *key,
+                       char *out, size_t out_size)
+{
+    /* Ищем "key=" в строке */
+    char search[64];
+    snprintf(search, sizeof(search), "%s=", key);
+
+    const char *pos = strstr(msg, search);
+    if (!pos) return 0;
+
+    pos += strlen(search);
+
+    /* Значение заканчивается на '|' или конец строки */
+    size_t i = 0;
+    while (*pos && *pos != '|' && i < out_size - 1)
+        out[i++] = *pos++;
+    out[i] = '\0';
+    return 1;
+}
+
+/* =========================================================
+ * handle_command — разобрать одну строку протокола и ответить
+ * ========================================================= */
+static void handle_command(Client *c, char *buf)
+{
+    char resp[BUF_SIZE];
+
+    /* Определяем тип команды — всё до первого '|' */
+    char type[32] = {0};
+    {
+        size_t i = 0;
+        while (buf[i] && buf[i] != '|' && i < sizeof(type) - 1)
+            { type[i] = buf[i]; i++; }
+        type[i] = '\0';
+    }
+
+    /* ---- AUTH ------------------------------------------- */
+    if (strcmp(type, MSG_AUTH) == 0) {
+        char login[MAX_LOGIN] = {0};
+        char pass [MAX_LOGIN] = {0};
+
+        if (!parse_field(buf, "login", login, sizeof(login)) ||
+            !parse_field(buf, "pass",  pass,  sizeof(pass))) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Неверный формат AUTH", ERR_BAD_FORMAT);
+            goto send_resp;
+        }
+
+        if (!db_auth(login, pass)) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Неверный логин или пароль", ERR_NOT_FOUND);
+            goto send_resp;
+        }
+
+        strncpy(c->login, login, MAX_LOGIN - 1);
+        printf("Авторизован: %s\n", c->login);
+        snprintf(resp, sizeof(resp), "OK|login=%s", login);
+        goto send_resp;
+    }
+
+    /* ---- REG -------------------------------------------- */
+    if (strcmp(type, MSG_REG) == 0) {
+        char login[MAX_LOGIN] = {0};
+        char pass [MAX_LOGIN] = {0};
+
+        if (!parse_field(buf, "login", login, sizeof(login)) ||
+            !parse_field(buf, "pass",  pass,  sizeof(pass))) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Неверный формат REG", ERR_BAD_FORMAT);
+            goto send_resp;
+        }
+
+        if (db_register(login, pass) != 0) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Логин уже занят", ERR_EXISTS);
+            goto send_resp;
+        }
+
+        strncpy(c->login, login, MAX_LOGIN - 1);
+        printf("Зарегистрирован: %s\n", c->login);
+        snprintf(resp, sizeof(resp), "OK|login=%s", login);
+        goto send_resp;
+    }
+
+    /* ---- Все остальные команды требуют авторизации ------- */
+    if (!c->login[0]) {
+        snprintf(resp, sizeof(resp),
+            "ERR|code=%d|desc=Сначала выполните AUTH или REG", ERR_FORBIDDEN);
+        goto send_resp;
+    }
+
+    /* TODO (этап 4): MSG, GRP, HIST, CREATE */
+    snprintf(resp, sizeof(resp),
+        "ERR|code=%d|desc=Команда %s будет в следующем этапе", ERR_BAD_FORMAT, type);
+
+send_resp:
+    fprintf(c->stream, "%s\n", resp);
+    fflush(c->stream);
+}
 
 /* =========================================================
  * net_listen — создать TCP-сокет и начать прослушивание
@@ -76,13 +182,11 @@ void *net_client_thread(void *arg)
         /* Убрать \n в конце */
         size_t len = strlen(buf);
         if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
+        if (len == 0) continue;
 
         printf("[%s] -> %s\n", c->login[0] ? c->login : "?", buf);
 
-        /* TODO (этап 3): разбор команд AUTH, REG, MSG, GRP, HIST, CREATE */
-        /* Пока просто эхо, чтобы убедиться что соединение работает */
-        fprintf(c->stream, "OK|echo=%s\n", buf);
-        fflush(c->stream);
+        handle_command(c, buf);
     }
 
     printf("Клиент отключился: %s\n", c->login[0] ? c->login : "?");
