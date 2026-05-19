@@ -12,6 +12,7 @@
 #include "network.h"
 #include "server.h"
 #include "db.h"
+#include <sqlite3.h>
 
 /* =========================================================
  * parse_field — извлечь значение поля из строки протокола
@@ -75,6 +76,15 @@ static void handle_command(Client *c, char *buf)
         strncpy(c->login, login, MAX_LOGIN - 1);
         printf("Авторизован: %s\n", c->login);
         snprintf(resp, sizeof(resp), "OK|login=%s", login);
+
+        /* Отдаём накопившиеся оффлайн-сообщения сразу после входа */
+        char *pending = db_get_pending(login);
+        if (pending && pending[0]) {
+            fprintf(c->stream, "%s", pending);
+            fflush(c->stream);
+            db_mark_delivered(login);
+        }
+        free(pending);
         goto send_resp;
     }
 
@@ -109,7 +119,93 @@ static void handle_command(Client *c, char *buf)
         goto send_resp;
     }
 
-    /* TODO (этап 4): MSG, GRP, HIST, CREATE */
+    /* ---- MSG — личное сообщение ------------------------- */
+    if (strcmp(type, MSG_SEND) == 0) {
+        char to  [MAX_LOGIN] = {0};
+        char text[MAX_TEXT]  = {0};
+
+        if (!parse_field(buf, "to",   to,   sizeof(to)) ||
+            !parse_field(buf, "text", text, sizeof(text))) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Неверный формат MSG", ERR_BAD_FORMAT);
+            goto send_resp;
+        }
+
+        /* Получаем или создаём личный чат */
+        int chat_id = db_get_or_create_dialog(c->login, to);
+        if (chat_id < 0) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Не удалось создать диалог", ERR_NOT_FOUND);
+            goto send_resp;
+        }
+
+        /* Сохраняем в БД — delivered=1 если получатель онлайн, иначе 0 */
+        pthread_mutex_lock(&g_clients_mutex);
+        Client *recipient = net_find_client(to);
+
+        /* Формируем строку для отправки получателю */
+        char incoming[BUF_SIZE];
+        snprintf(incoming, sizeof(incoming),
+            "INCOMING|chat_id=%d|from=%s|body=%s",
+            chat_id, c->login, text);
+
+        if (recipient) {
+            /* Получатель онлайн — отправляем сразу */
+            fprintf(recipient->stream, "%s\n", incoming);
+            fflush(recipient->stream);
+        }
+        pthread_mutex_unlock(&g_clients_mutex);
+
+        /* Сохраняем в БД (delivered=1 если онлайн, 0 если оффлайн) */
+        db_save_message(chat_id, c->login, text, 0, 0);
+        if (!recipient) {
+            /* Помечаем как недоставленное — обновляем последнее сообщение */
+            /* db_save_message уже пишет delivered=1 по умолчанию,
+             * для оффлайн переписываем через отдельный UPDATE */
+            pthread_mutex_lock(&g_db_mutex);
+            sqlite3_stmt *upd = NULL;
+            if (sqlite3_prepare_v2(g_db,
+                    "UPDATE messages SET delivered=0"
+                    " WHERE msg_id=(SELECT MAX(msg_id) FROM messages"
+                    "               WHERE chat_id=? AND sender=?);",
+                    -1, &upd, NULL) == SQLITE_OK) {
+                sqlite3_bind_int (upd, 1, chat_id);
+                sqlite3_bind_text(upd, 2, c->login, -1, SQLITE_STATIC);
+                sqlite3_step(upd);
+                sqlite3_finalize(upd);
+            }
+            pthread_mutex_unlock(&g_db_mutex);
+        }
+
+        snprintf(resp, sizeof(resp), "OK|chat_id=%d", chat_id);
+        goto send_resp;
+    }
+
+    /* ---- HIST — история сообщений ----------------------- */
+    if (strcmp(type, MSG_HIST) == 0) {
+        char chat_id_str[32] = {0};
+        if (!parse_field(buf, "chat_id", chat_id_str, sizeof(chat_id_str))) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Неверный формат HIST", ERR_BAD_FORMAT);
+            goto send_resp;
+        }
+
+        int chat_id = atoi(chat_id_str);
+        char *history = db_get_history(chat_id, 50);
+        if (!history) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Не удалось получить историю", ERR_NOT_FOUND);
+            goto send_resp;
+        }
+
+        /* История может быть многострочной — отправляем как есть */
+        fprintf(c->stream, "%s", history);
+        fflush(c->stream);
+        free(history);
+        return; /* Уже отправили — не идём в send_resp */
+    }
+
+    /* TODO (этап 5): GRP, CREATE */
     snprintf(resp, sizeof(resp),
         "ERR|code=%d|desc=Команда %s будет в следующем этапе", ERR_BAD_FORMAT, type);
 

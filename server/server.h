@@ -2,6 +2,7 @@
 #define SERVER_H
 
 #include <pthread.h>
+#include <sqlite3.h>
 #include "../common/protocol.h"
 
 /* =========================================================
@@ -22,8 +23,7 @@ extern Client          *g_clients;
 extern pthread_mutex_t  g_clients_mutex;
 
 /* Дескриптор базы данных (определён в db.c) */
-struct sqlite3;
-extern struct sqlite3  *g_db;
+extern sqlite3         *g_db;
 extern pthread_mutex_t  g_db_mutex;
 
 #endif /* SERVER_H */

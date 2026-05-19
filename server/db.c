@@ -307,8 +307,79 @@ int db_get_members(int chat_id, char logins[][64], int max_count)
 }
 
 /* =========================================================
+ * db_get_or_create_dialog — найти или создать личный чат
+ * между двумя пользователями. Возвращает chat_id или -1.
+ * ========================================================= */
+int db_get_or_create_dialog(const char *login_a, const char *login_b)
+{
+    pthread_mutex_lock(&g_db_mutex);
+
+    /* Ищем существующий личный чат где оба являются участниками */
+    sqlite3_stmt *stmt = NULL;
+    int chat_id = -1;
+
+    const char *sql_find =
+        "SELECT cm1.chat_id FROM chat_members cm1"
+        " JOIN chat_members cm2 ON cm1.chat_id = cm2.chat_id"
+        " JOIN chats c ON c.chat_id = cm1.chat_id"
+        " WHERE cm1.user_login=? AND cm2.user_login=? AND c.is_group=0"
+        " LIMIT 1;";
+
+    if (sqlite3_prepare_v2(g_db, sql_find, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, login_a, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, login_b, -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_ROW)
+            chat_id = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+    }
+
+    if (chat_id >= 0) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return chat_id;
+    }
+
+    /* Не нашли — создаём новый личный чат */
+    char name[MAX_CHAT_NAME];
+    snprintf(name, sizeof(name), "%s<->%s", login_a, login_b);
+
+    sqlite3_exec(g_db, "BEGIN;", NULL, NULL, NULL);
+
+    if (sqlite3_prepare_v2(g_db,
+            "INSERT INTO chats (chat_name, is_group) VALUES (?, 0);",
+            -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_DONE)
+            chat_id = (int)sqlite3_last_insert_rowid(g_db);
+        sqlite3_finalize(stmt);
+    }
+
+    if (chat_id < 0) {
+        sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
+        pthread_mutex_unlock(&g_db_mutex);
+        return -1;
+    }
+
+    /* Добавляем обоих участников */
+    const char *members[2] = { login_a, login_b };
+    for (int i = 0; i < 2; i++) {
+        if (sqlite3_prepare_v2(g_db,
+                "INSERT OR IGNORE INTO chat_members (chat_id, user_login)"
+                " VALUES (?, ?);",
+                -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int (stmt, 1, chat_id);
+            sqlite3_bind_text(stmt, 2, members[i], -1, SQLITE_STATIC);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    sqlite3_exec(g_db, "COMMIT;", NULL, NULL, NULL);
+    pthread_mutex_unlock(&g_db_mutex);
+    return chat_id;
+}
+
+/* =========================================================
  * db_mark_delivered / db_get_pending
- * (используются для оффлайн-сообщений — этап 4)
  * ========================================================= */
 void db_mark_delivered(const char *login)
 {
@@ -326,9 +397,58 @@ void db_mark_delivered(const char *login)
     pthread_mutex_unlock(&g_db_mutex);
 }
 
+/* Возвращает недоставленные сообщения для login в том же формате что HIST.
+ * Вызывающий обязан освободить через free(). */
 char *db_get_pending(const char *login)
 {
-    /* TODO (этап 4): вернуть сообщения с delivered=0 для данного пользователя */
-    (void)login;
-    return NULL;
+    pthread_mutex_lock(&g_db_mutex);
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT m.msg_id, m.chat_id, m.sender, m.body, m.sent_at,"
+        "       m.reply_to, m.fwd_from"
+        " FROM messages m"
+        " JOIN chat_members cm ON cm.chat_id = m.chat_id"
+        " WHERE cm.user_login=? AND m.delivered=0 AND m.sender!=?"
+        " ORDER BY m.msg_id ASC;";
+
+    size_t buf_size = 16384;
+    char  *buf = malloc(buf_size);
+    if (!buf) { pthread_mutex_unlock(&g_db_mutex); return NULL; }
+    buf[0] = '\0';
+
+    int count = 0;
+    char rows[100][600];
+
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, login, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, login, -1, SQLITE_STATIC);
+        while (sqlite3_step(stmt) == SQLITE_ROW && count < 100) {
+            long long msg_id   = sqlite3_column_int64(stmt, 0);
+            int       chat_id  = sqlite3_column_int  (stmt, 1);
+            const char *sender = (const char *)sqlite3_column_text(stmt, 2);
+            const char *body   = (const char *)sqlite3_column_text(stmt, 3);
+            long long sent_at  = sqlite3_column_int64(stmt, 4);
+            long long reply_to = sqlite3_column_int64(stmt, 5);
+            int fwd_from       = sqlite3_column_int  (stmt, 6);
+
+            snprintf(rows[count], sizeof(rows[count]),
+                "INCOMING|msg_id=%lld|chat_id=%d|from=%s|body=%s"
+                "|sent_at=%lld|reply_to=%lld|fwd_from=%d",
+                msg_id, chat_id,
+                sender   ? sender : "",
+                body     ? body   : "",
+                sent_at, reply_to, fwd_from);
+            count++;
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    for (int i = 0; i < count; i++) {
+        strncat(buf, rows[i], buf_size - strlen(buf) - 2);
+        strncat(buf, "\n",    buf_size - strlen(buf) - 1);
+    }
+
+    pthread_mutex_unlock(&g_db_mutex);
+    return buf;
 }

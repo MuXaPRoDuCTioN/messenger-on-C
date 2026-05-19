@@ -96,9 +96,29 @@ void *net_recv_thread(void *arg)
         size_t len = strlen(buf);
         if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
 
-        /* TODO (этап 3): разбирать тип ответа (OK, ERR, MSG, GRP и т.д.) */
-        /* Пока — просто выводим в UI как есть */
-        ui_append_message("server", buf);
+        /* Разбираем тип ответа */
+        if (strncmp(buf, "INCOMING|", 9) == 0) {
+            /* Входящее сообщение: INCOMING|chat_id=...|from=...|body=... */
+            char from[MAX_LOGIN] = {0};
+            char body[MAX_TEXT]  = {0};
+
+            /* Простой парсер — ищем from= и body= */
+            const char *p;
+            if ((p = strstr(buf, "from=")) != NULL) {
+                p += 5;
+                size_t i = 0;
+                while (*p && *p != '|' && i < sizeof(from)-1) from[i++] = *p++;
+            }
+            if ((p = strstr(buf, "body=")) != NULL) {
+                p += 5;
+                size_t i = 0;
+                while (*p && *p != '|' && i < sizeof(body)-1) body[i++] = *p++;
+            }
+            ui_append_message(from, body);
+        } else {
+            /* Остальные ответы (OK, ERR, HIST...) — показываем как есть */
+            ui_append_message("server", buf);
+        }
     }
 
     /* Соединение потеряно */
