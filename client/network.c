@@ -98,22 +98,34 @@ void *net_recv_thread(void *arg)
 
         /* Разбираем тип ответа */
         if (strncmp(buf, "INCOMING|", 9) == 0) {
-            /* Входящее сообщение: INCOMING|chat_id=...|from=...|body=... */
-            char from[MAX_LOGIN] = {0};
-            char body[MAX_TEXT]  = {0};
+            char from    [MAX_LOGIN] = {0};
+            char body    [MAX_TEXT]  = {0};
+            char reply_to[32]        = {0};
+            char fwd_from[32]        = {0};
 
             const char *p;
-            if ((p = strstr(buf, "from=")) != NULL) {
-                p += 5;
-                size_t i = 0;
-                while (*p && *p != '|' && i < sizeof(from)-1) from[i++] = *p++;
+            if ((p = strstr(buf, "from="))     != NULL) { p += 5; size_t i=0; while(*p&&*p!='|'&&i<sizeof(from)-1)     from[i++]=*p++; }
+            if ((p = strstr(buf, "body="))     != NULL) { p += 5; size_t i=0; while(*p&&*p!='|'&&i<sizeof(body)-1)     body[i++]=*p++; }
+            if ((p = strstr(buf, "reply_to=")) != NULL) { p += 9; size_t i=0; while(*p&&*p!='|'&&i<sizeof(reply_to)-1) reply_to[i++]=*p++; }
+            if ((p = strstr(buf, "fwd_from=")) != NULL) { p += 9; size_t i=0; while(*p&&*p!='|'&&i<sizeof(fwd_from)-1) fwd_from[i++]=*p++; }
+
+            char display[BUF_SIZE] = {0};
+
+            /* Пометка цитаты */
+            if (reply_to[0] && strcmp(reply_to, "0") != 0) {
+                char prefix[128];
+                snprintf(prefix, sizeof(prefix), "[ответ на #%s] ", reply_to);
+                strncat(display, prefix, sizeof(display) - strlen(display) - 1);
             }
-            if ((p = strstr(buf, "body=")) != NULL) {
-                p += 5;
-                size_t i = 0;
-                while (*p && *p != '|' && i < sizeof(body)-1) body[i++] = *p++;
+            /* Пометка пересылки */
+            if (fwd_from[0] && strcmp(fwd_from, "0") != 0) {
+                char prefix[128];
+                snprintf(prefix, sizeof(prefix), "[переслано из msg#%s] ", fwd_from);
+                strncat(display, prefix, sizeof(display) - strlen(display) - 1);
             }
-            ui_append_message(from, body);
+
+            strncat(display, body, sizeof(display) - strlen(display) - 1);
+            ui_append_message(from, display);
 
         } else if (strncmp(buf, "CHATLIST_UPDATE|", 16) == 0) {
             /* Нас добавили в новый групповой чат */

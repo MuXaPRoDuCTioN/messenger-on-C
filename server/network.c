@@ -364,6 +364,128 @@ static void handle_command(Client *c, char *buf)
         return;
     }
 
+    /* ---- REPLY — ответ на сообщение с цитатой ----------- */
+    if (strcmp(type, MSG_REPLY) == 0) {
+        char to         [MAX_LOGIN] = {0};
+        char chat_id_str[32]        = {0};
+        char text       [MAX_TEXT]  = {0};
+        char reply_to_str[32]       = {0};
+
+        /* Может быть личным (to=) или групповым (chat_id=) */
+        int is_group = parse_field(buf, "chat_id", chat_id_str, sizeof(chat_id_str));
+        int is_private = parse_field(buf, "to", to, sizeof(to));
+
+        if ((!is_group && !is_private) ||
+            !parse_field(buf, "text",     text,         sizeof(text)) ||
+            !parse_field(buf, "reply_to", reply_to_str, sizeof(reply_to_str))) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Неверный формат REPLY", ERR_BAD_FORMAT);
+            goto send_resp;
+        }
+
+        long long reply_to = atoll(reply_to_str);
+        int chat_id = -1;
+
+        if (is_private) {
+            chat_id = db_get_or_create_dialog(c->login, to);
+        } else {
+            chat_id = atoi(chat_id_str);
+        }
+
+        if (chat_id < 0) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Чат не найден", ERR_NOT_FOUND);
+            goto send_resp;
+        }
+
+        long long msg_id = db_save_message(chat_id, c->login, text, reply_to, 0);
+
+        /* Формируем INCOMING с пометкой reply_to */
+        char incoming[BUF_SIZE];
+        snprintf(incoming, sizeof(incoming),
+            "INCOMING|msg_id=%lld|chat_id=%d|from=%s|body=%s|reply_to=%lld",
+            msg_id, chat_id, c->login, text, reply_to);
+
+        /* Рассылаем участникам чата */
+        char logins[MAX_MEMBERS][64];
+        int  mcount = db_get_members(chat_id, logins, MAX_MEMBERS);
+
+        Client *targets[MAX_MEMBERS];
+        int     tcount = 0;
+        pthread_mutex_lock(&g_clients_mutex);
+        for (int i = 0; i < mcount; i++) {
+            if (strcmp(logins[i], c->login) == 0) continue;
+            Client *m = net_find_client(logins[i]);
+            if (m) targets[tcount++] = m;
+        }
+        pthread_mutex_unlock(&g_clients_mutex);
+        for (int i = 0; i < tcount; i++)
+            client_send(targets[i], incoming);
+
+        snprintf(resp, sizeof(resp), "OK|msg_id=%lld|reply_to=%lld", msg_id, reply_to);
+        goto send_resp;
+    }
+
+    /* ---- FWD — пересылка сообщения ---------------------- */
+    if (strcmp(type, MSG_FWD) == 0) {
+        char to         [MAX_LOGIN] = {0};
+        char chat_id_str[32]        = {0};
+        char fwd_msg_str[32]        = {0}; /* id пересылаемого сообщения */
+        char text       [MAX_TEXT]  = {0}; /* текст оригинала (клиент передаёт) */
+
+        int is_group   = parse_field(buf, "chat_id", chat_id_str, sizeof(chat_id_str));
+        int is_private  = parse_field(buf, "to",      to,          sizeof(to));
+
+        if ((!is_group && !is_private) ||
+            !parse_field(buf, "fwd_msg", fwd_msg_str, sizeof(fwd_msg_str)) ||
+            !parse_field(buf, "text",    text,         sizeof(text))) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Неверный формат FWD", ERR_BAD_FORMAT);
+            goto send_resp;
+        }
+
+        int fwd_msg_id = atoi(fwd_msg_str);
+        int chat_id = -1;
+
+        if (is_private) {
+            chat_id = db_get_or_create_dialog(c->login, to);
+        } else {
+            chat_id = atoi(chat_id_str);
+        }
+
+        if (chat_id < 0) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Чат не найден", ERR_NOT_FOUND);
+            goto send_resp;
+        }
+
+        /* fwd_from = id исходного сообщения */
+        long long msg_id = db_save_message(chat_id, c->login, text, 0, fwd_msg_id);
+
+        char incoming[BUF_SIZE];
+        snprintf(incoming, sizeof(incoming),
+            "INCOMING|msg_id=%lld|chat_id=%d|from=%s|body=%s|fwd_from=%d",
+            msg_id, chat_id, c->login, text, fwd_msg_id);
+
+        char logins[MAX_MEMBERS][64];
+        int  mcount = db_get_members(chat_id, logins, MAX_MEMBERS);
+
+        Client *targets[MAX_MEMBERS];
+        int     tcount = 0;
+        pthread_mutex_lock(&g_clients_mutex);
+        for (int i = 0; i < mcount; i++) {
+            if (strcmp(logins[i], c->login) == 0) continue;
+            Client *m = net_find_client(logins[i]);
+            if (m) targets[tcount++] = m;
+        }
+        pthread_mutex_unlock(&g_clients_mutex);
+        for (int i = 0; i < tcount; i++)
+            client_send(targets[i], incoming);
+
+        snprintf(resp, sizeof(resp), "OK|msg_id=%lld|fwd_from=%d", msg_id, fwd_msg_id);
+        goto send_resp;
+    }
+
     snprintf(resp, sizeof(resp),
         "ERR|code=%d|desc=Неизвестная команда: %s", ERR_BAD_FORMAT, type);
 
