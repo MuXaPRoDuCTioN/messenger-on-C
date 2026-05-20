@@ -14,7 +14,6 @@
 /* Глобальные переменные (объявлены extern в server.h) */
 Client          *g_clients       = NULL;
 pthread_mutex_t  g_clients_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t  g_db_mutex      = PTHREAD_MUTEX_INITIALIZER;
 
 int main(int argc, char *argv[])
 {
@@ -56,6 +55,7 @@ int main(int argc, char *argv[])
             continue;
         }
         c->fd = cli_fd;
+        pthread_mutex_init(&c->write_mutex, NULL);
 
         /* Добавляем в список и запускаем поток */
         net_add_client(c);

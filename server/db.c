@@ -7,7 +7,7 @@
 #include "db.h"
 #include "server.h"
 
-/* Единственный экземпляр БД — доступ только через g_db_mutex */
+/* Единственный экземпляр БД — потокобезопасность через SQLITE_OPEN_FULLMUTEX */
 sqlite3 *g_db = NULL;
 
 /* =========================================================
@@ -30,7 +30,12 @@ static int db_exec(const char *sql)
  * ========================================================= */
 int db_open(const char *path)
 {
-    if (sqlite3_open(path, &g_db) != SQLITE_OK) {
+    /* SQLITE_OPEN_FULLMUTEX — SQLite сам обеспечивает потокобезопасность.
+     * Это надёжнее чем наш g_db_mutex, который создавал очереди блокировок
+     * между потоками клиентов при одновременных операциях с БД. */
+    if (sqlite3_open_v2(path, &g_db,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+            NULL) != SQLITE_OK) {
         fprintf(stderr, "Не удалось открыть БД: %s\n", sqlite3_errmsg(g_db));
         return -1;
     }
@@ -101,7 +106,6 @@ void db_close(void)
  * ========================================================= */
 int db_auth(const char *login, const char *pass_hash)
 {
-    pthread_mutex_lock(&g_db_mutex);
 
     sqlite3_stmt *stmt = NULL;
     const char *sql =
@@ -116,7 +120,6 @@ int db_auth(const char *login, const char *pass_hash)
         sqlite3_finalize(stmt);
     }
 
-    pthread_mutex_unlock(&g_db_mutex);
     return found;
 }
 
@@ -126,7 +129,6 @@ int db_auth(const char *login, const char *pass_hash)
  * ========================================================= */
 int db_register(const char *login, const char *pass_hash)
 {
-    pthread_mutex_lock(&g_db_mutex);
 
     sqlite3_stmt *stmt = NULL;
     const char *sql =
@@ -141,7 +143,6 @@ int db_register(const char *login, const char *pass_hash)
         sqlite3_finalize(stmt);
     }
 
-    pthread_mutex_unlock(&g_db_mutex);
     return rc; /* SQLITE_CONSTRAINT при дубликате → rc остаётся -1 */
 }
 
@@ -152,7 +153,6 @@ long long db_save_message(int chat_id, const char *sender,
                           const char *body,
                           long long reply_to, int fwd_from)
 {
-    pthread_mutex_lock(&g_db_mutex);
 
     sqlite3_stmt *stmt = NULL;
     const char *sql =
@@ -171,7 +171,6 @@ long long db_save_message(int chat_id, const char *sender,
         sqlite3_finalize(stmt);
     }
 
-    pthread_mutex_unlock(&g_db_mutex);
     return id;
 }
 
@@ -183,7 +182,6 @@ long long db_save_message(int chat_id, const char *sender,
  * ========================================================= */
 char *db_get_history(int chat_id, int limit)
 {
-    pthread_mutex_lock(&g_db_mutex);
 
     sqlite3_stmt *stmt = NULL;
     const char *sql =
@@ -194,7 +192,6 @@ char *db_get_history(int chat_id, int limit)
     /* Выделяем буфер с запасом */
     size_t buf_size = 16384;
     char  *buf = malloc(buf_size);
-    if (!buf) { pthread_mutex_unlock(&g_db_mutex); return NULL; }
     buf[0] = '\0';
 
     int count = 0;
@@ -231,7 +228,6 @@ char *db_get_history(int chat_id, int limit)
         strncat(buf, "\n",       buf_size - strlen(buf) - 1);
     }
 
-    pthread_mutex_unlock(&g_db_mutex);
     return buf;
 }
 
@@ -240,7 +236,6 @@ char *db_get_history(int chat_id, int limit)
  * ========================================================= */
 int db_create_group(const char *name, const char *members[], int count)
 {
-    pthread_mutex_lock(&g_db_mutex);
 
     db_exec("BEGIN;");
 
@@ -259,7 +254,6 @@ int db_create_group(const char *name, const char *members[], int count)
 
     if (chat_id < 0) {
         db_exec("ROLLBACK;");
-        pthread_mutex_unlock(&g_db_mutex);
         return -1;
     }
 
@@ -276,7 +270,6 @@ int db_create_group(const char *name, const char *members[], int count)
     }
 
     db_exec("COMMIT;");
-    pthread_mutex_unlock(&g_db_mutex);
     return chat_id;
 }
 
@@ -285,7 +278,6 @@ int db_create_group(const char *name, const char *members[], int count)
  * ========================================================= */
 int db_get_members(int chat_id, char logins[][64], int max_count)
 {
-    pthread_mutex_lock(&g_db_mutex);
 
     sqlite3_stmt *stmt = NULL;
     int n = 0;
@@ -302,7 +294,6 @@ int db_get_members(int chat_id, char logins[][64], int max_count)
         sqlite3_finalize(stmt);
     }
 
-    pthread_mutex_unlock(&g_db_mutex);
     return n;
 }
 
@@ -312,7 +303,6 @@ int db_get_members(int chat_id, char logins[][64], int max_count)
  * ========================================================= */
 int db_get_or_create_dialog(const char *login_a, const char *login_b)
 {
-    pthread_mutex_lock(&g_db_mutex);
 
     /* Ищем существующий личный чат где оба являются участниками */
     sqlite3_stmt *stmt = NULL;
@@ -334,7 +324,6 @@ int db_get_or_create_dialog(const char *login_a, const char *login_b)
     }
 
     if (chat_id >= 0) {
-        pthread_mutex_unlock(&g_db_mutex);
         return chat_id;
     }
 
@@ -355,7 +344,6 @@ int db_get_or_create_dialog(const char *login_a, const char *login_b)
 
     if (chat_id < 0) {
         sqlite3_exec(g_db, "ROLLBACK;", NULL, NULL, NULL);
-        pthread_mutex_unlock(&g_db_mutex);
         return -1;
     }
 
@@ -374,8 +362,54 @@ int db_get_or_create_dialog(const char *login_a, const char *login_b)
     }
 
     sqlite3_exec(g_db, "COMMIT;", NULL, NULL, NULL);
-    pthread_mutex_unlock(&g_db_mutex);
     return chat_id;
+}
+
+/* =========================================================
+ * db_get_user_chats — список всех чатов пользователя
+ * Формат ответа:
+ *   CHATS|count=N\nchat_id=1|name=vasya<->petya|is_group=0\n...
+ * Вызывающий обязан освободить через free()
+ * ========================================================= */
+char *db_get_user_chats(const char *login)
+{
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT c.chat_id, c.chat_name, c.is_group"
+        " FROM chats c"
+        " JOIN chat_members cm ON cm.chat_id = c.chat_id"
+        " WHERE cm.user_login = ?"
+        " ORDER BY c.chat_id ASC;";
+
+    size_t buf_size = 8192;
+    char  *buf = malloc(buf_size);
+    buf[0] = '\0';
+
+    char rows[128][256];
+    int  count = 0;
+
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, login, -1, SQLITE_STATIC);
+        while (sqlite3_step(stmt) == SQLITE_ROW && count < 128) {
+            int         chat_id  = sqlite3_column_int (stmt, 0);
+            const char *name     = (const char *)sqlite3_column_text(stmt, 1);
+            int         is_group = sqlite3_column_int (stmt, 2);
+            snprintf(rows[count], sizeof(rows[count]),
+                "chat_id=%d|name=%s|is_group=%d",
+                chat_id, name ? name : "", is_group);
+            count++;
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    snprintf(buf, buf_size, "CHATS|count=%d\n", count);
+    for (int i = 0; i < count; i++) {
+        strncat(buf, rows[i], buf_size - strlen(buf) - 2);
+        strncat(buf, "\n",    buf_size - strlen(buf) - 1);
+    }
+
+    return buf;
 }
 
 /* =========================================================
@@ -383,7 +417,6 @@ int db_get_or_create_dialog(const char *login_a, const char *login_b)
  * ========================================================= */
 void db_mark_delivered(const char *login)
 {
-    pthread_mutex_lock(&g_db_mutex);
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(g_db,
             "UPDATE messages SET delivered=1"
@@ -394,14 +427,12 @@ void db_mark_delivered(const char *login)
         sqlite3_step(stmt);
         sqlite3_finalize(stmt);
     }
-    pthread_mutex_unlock(&g_db_mutex);
 }
 
 /* Возвращает недоставленные сообщения для login в том же формате что HIST.
  * Вызывающий обязан освободить через free(). */
 char *db_get_pending(const char *login)
 {
-    pthread_mutex_lock(&g_db_mutex);
 
     sqlite3_stmt *stmt = NULL;
     const char *sql =
@@ -414,7 +445,6 @@ char *db_get_pending(const char *login)
 
     size_t buf_size = 16384;
     char  *buf = malloc(buf_size);
-    if (!buf) { pthread_mutex_unlock(&g_db_mutex); return NULL; }
     buf[0] = '\0';
 
     int count = 0;
@@ -449,6 +479,5 @@ char *db_get_pending(const char *login)
         strncat(buf, "\n",    buf_size - strlen(buf) - 1);
     }
 
-    pthread_mutex_unlock(&g_db_mutex);
     return buf;
 }

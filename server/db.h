@@ -40,6 +40,10 @@ char *db_get_history(int chat_id, int limit);
  * Возвращает chat_id или -1 при ошибке. */
 int  db_get_or_create_dialog(const char *login_a, const char *login_b);
 
+/* Получить список всех чатов пользователя в виде форматированной строки.
+ * Вызывающий обязан освободить через free(). */
+char *db_get_user_chats(const char *login);
+
 /* --- Групповые чаты -------------------------------------- */
 
 /* Создать групповой чат. Возвращает chat_id или -1. */

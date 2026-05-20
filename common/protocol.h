@@ -23,10 +23,13 @@
 #define MSG_FWD         "FWD"    /* FWD|...|fwd_from=<chat_id>       */
 #define MSG_HIST        "HIST"   /* HIST|chat_id=...                 */
 #define MSG_CREATE      "CREATE" /* CREATE|name=...|members=a,b,c    */
+#define MSG_CHATS       "CHATS"  /* CHATS  — список своих чатов      */
 
-/* Типы ответов сервер → клиент */
-#define RESP_OK         "OK"
-#define RESP_ERR        "ERR"
+/* Типы сообщений сервер → клиент */
+#define RESP_OK              "OK"
+#define RESP_ERR             "ERR"
+#define RESP_INCOMING        "INCOMING"       /* Входящее сообщение         */
+#define RESP_CHATLIST_UPDATE "CHATLIST_UPDATE" /* Добавлен в новый чат       */
 
 /* Коды ошибок */
 #define ERR_BAD_FORMAT  1   /* Неверный формат сообщения   */

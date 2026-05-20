@@ -102,7 +102,6 @@ void *net_recv_thread(void *arg)
             char from[MAX_LOGIN] = {0};
             char body[MAX_TEXT]  = {0};
 
-            /* Простой парсер — ищем from= и body= */
             const char *p;
             if ((p = strstr(buf, "from=")) != NULL) {
                 p += 5;
@@ -115,8 +114,28 @@ void *net_recv_thread(void *arg)
                 while (*p && *p != '|' && i < sizeof(body)-1) body[i++] = *p++;
             }
             ui_append_message(from, body);
+
+        } else if (strncmp(buf, "CHATLIST_UPDATE|", 16) == 0) {
+            /* Нас добавили в новый групповой чат */
+            char chat_id_str[32] = {0};
+            char name[MAX_CHAT_NAME] = {0};
+            const char *p;
+            if ((p = strstr(buf, "chat_id=")) != NULL) {
+                p += 8;
+                size_t i = 0;
+                while (*p && *p != '|' && i < sizeof(chat_id_str)-1) chat_id_str[i++] = *p++;
+            }
+            if ((p = strstr(buf, "name=")) != NULL) {
+                p += 5;
+                size_t i = 0;
+                while (*p && *p != '|' && i < sizeof(name)-1) name[i++] = *p++;
+            }
+            char notice[BUF_SIZE];
+            snprintf(notice, sizeof(notice),
+                "Вас добавили в групповой чат \"%s\" (chat_id=%s)", name, chat_id_str);
+            ui_set_status(notice);
+
         } else {
-            /* Остальные ответы (OK, ERR, HIST...) — показываем как есть */
             ui_append_message("server", buf);
         }
     }

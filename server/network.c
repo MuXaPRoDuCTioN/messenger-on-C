@@ -14,6 +14,9 @@
 #include "db.h"
 #include <sqlite3.h>
 
+/* Forward declaration — определение ниже, после handle_command */
+static void client_send(Client *c, const char *msg);
+
 /* =========================================================
  * parse_field — извлечь значение поля из строки протокола
  * Формат: ТИП|ключ=значение|ключ=значение
@@ -80,8 +83,10 @@ static void handle_command(Client *c, char *buf)
         /* Отдаём накопившиеся оффлайн-сообщения сразу после входа */
         char *pending = db_get_pending(login);
         if (pending && pending[0]) {
+            pthread_mutex_lock(&c->write_mutex);
             fprintf(c->stream, "%s", pending);
             fflush(c->stream);
+            pthread_mutex_unlock(&c->write_mutex);
             db_mark_delivered(login);
         }
         free(pending);
@@ -139,22 +144,22 @@ static void handle_command(Client *c, char *buf)
             goto send_resp;
         }
 
-        /* Сохраняем в БД — delivered=1 если получатель онлайн, иначе 0 */
-        pthread_mutex_lock(&g_clients_mutex);
-        Client *recipient = net_find_client(to);
-
-        /* Формируем строку для отправки получателю */
+        /* Формируем строку для получателя */
         char incoming[BUF_SIZE];
         snprintf(incoming, sizeof(incoming),
             "INCOMING|chat_id=%d|from=%s|body=%s",
             chat_id, c->login, text);
 
+        /* Сохраняем в БД — delivered=1 если получатель онлайн, иначе 0 */
+        pthread_mutex_lock(&g_clients_mutex);
+        Client *recipient = net_find_client(to);
         if (recipient) {
-            /* Получатель онлайн — отправляем сразу */
-            fprintf(recipient->stream, "%s\n", incoming);
-            fflush(recipient->stream);
+            Client *r = recipient;
+            pthread_mutex_unlock(&g_clients_mutex);
+            client_send(r, incoming);
+        } else {
+            pthread_mutex_unlock(&g_clients_mutex);
         }
-        pthread_mutex_unlock(&g_clients_mutex);
 
         /* Сохраняем в БД (delivered=1 если онлайн, 0 если оффлайн) */
         db_save_message(chat_id, c->login, text, 0, 0);
@@ -162,7 +167,6 @@ static void handle_command(Client *c, char *buf)
             /* Помечаем как недоставленное — обновляем последнее сообщение */
             /* db_save_message уже пишет delivered=1 по умолчанию,
              * для оффлайн переписываем через отдельный UPDATE */
-            pthread_mutex_lock(&g_db_mutex);
             sqlite3_stmt *upd = NULL;
             if (sqlite3_prepare_v2(g_db,
                     "UPDATE messages SET delivered=0"
@@ -174,7 +178,6 @@ static void handle_command(Client *c, char *buf)
                 sqlite3_step(upd);
                 sqlite3_finalize(upd);
             }
-            pthread_mutex_unlock(&g_db_mutex);
         }
 
         snprintf(resp, sizeof(resp), "OK|chat_id=%d", chat_id);
@@ -199,19 +202,188 @@ static void handle_command(Client *c, char *buf)
         }
 
         /* История может быть многострочной — отправляем как есть */
+        pthread_mutex_lock(&c->write_mutex);
         fprintf(c->stream, "%s", history);
         fflush(c->stream);
+        pthread_mutex_unlock(&c->write_mutex);
         free(history);
         return; /* Уже отправили — не идём в send_resp */
     }
 
-    /* TODO (этап 5): GRP, CREATE */
+    /* ---- CREATE — создать групповой чат ----------------- */
+    if (strcmp(type, MSG_CREATE) == 0) {
+        char name   [MAX_CHAT_NAME] = {0};
+        char members_str[BUF_SIZE]  = {0};
+
+        if (!parse_field(buf, "name",    name,        sizeof(name)) ||
+            !parse_field(buf, "members", members_str, sizeof(members_str))) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Неверный формат CREATE", ERR_BAD_FORMAT);
+            goto send_resp;
+        }
+
+        /* Разбиваем строку "vasya,petya,kolya" на массив логинов */
+        /* Создатель добавляется автоматически */
+        const char *member_ptrs[MAX_MEMBERS + 1];
+        char        member_buf [MAX_MEMBERS][MAX_LOGIN];
+        int         count = 0;
+
+        /* Добавляем самого создателя первым */
+        strncpy(member_buf[count], c->login, MAX_LOGIN - 1);
+        member_ptrs[count] = member_buf[count];
+        count++;
+
+        /* Парсим остальных через strtok на копии строки */
+        char tmp[BUF_SIZE];
+        strncpy(tmp, members_str, sizeof(tmp) - 1);
+        char *tok = strtok(tmp, ",");
+        while (tok && count < MAX_MEMBERS) {
+            /* Не дублируем создателя если он указал себя */
+            if (strcmp(tok, c->login) != 0) {
+                strncpy(member_buf[count], tok, MAX_LOGIN - 1);
+                member_ptrs[count] = member_buf[count];
+                count++;
+            }
+            tok = strtok(NULL, ",");
+        }
+
+        int chat_id = db_create_group(name, member_ptrs, count);
+        if (chat_id < 0) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Не удалось создать группу", ERR_BAD_FORMAT);
+            goto send_resp;
+        }
+
+        /* Уведомляем онлайн-участников — собираем Client* под мьютексом */
+        char notify[BUF_SIZE];
+        snprintf(notify, sizeof(notify),
+            "CHATLIST_UPDATE|chat_id=%d|name=%s|is_group=1", chat_id, name);
+
+        Client *notify_clients[MAX_MEMBERS];
+        int     notify_count = 0;
+
+        pthread_mutex_lock(&g_clients_mutex);
+        for (int i = 0; i < count; i++) {
+            Client *m = net_find_client(member_ptrs[i]);
+            if (m && m != c)
+                notify_clients[notify_count++] = m;
+        }
+        pthread_mutex_unlock(&g_clients_mutex);
+
+        /* Пишем через write_mutex каждого клиента — безопасно */
+        for (int i = 0; i < notify_count; i++)
+            client_send(notify_clients[i], notify);
+
+        printf("Создан групповой чат [%d] \"%s\" (%d участников)\n",
+               chat_id, name, count);
+        snprintf(resp, sizeof(resp),
+            "OK|chat_id=%d|name=%s", chat_id, name);
+        goto send_resp;
+    }
+
+    /* ---- GRP — сообщение в групповой чат ---------------- */
+    if (strcmp(type, MSG_GRP) == 0) {
+        char chat_id_str[32]    = {0};
+        char text       [MAX_TEXT] = {0};
+
+        if (!parse_field(buf, "chat_id", chat_id_str, sizeof(chat_id_str)) ||
+            !parse_field(buf, "text",    text,         sizeof(text))) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Неверный формат GRP", ERR_BAD_FORMAT);
+            goto send_resp;
+        }
+
+        int chat_id = atoi(chat_id_str);
+
+        /* Получаем список участников группы */
+        char logins[MAX_MEMBERS][64];
+        int  member_count = db_get_members(chat_id, logins, MAX_MEMBERS);
+
+        if (member_count == 0) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Чат не найден или нет участников", ERR_NOT_FOUND);
+            goto send_resp;
+        }
+
+        /* Сохраняем сообщение в БД */
+        long long msg_id = db_save_message(chat_id, c->login, text, 0, 0);
+
+        /* Формируем строку для получателей */
+        char incoming[BUF_SIZE];
+        snprintf(incoming, sizeof(incoming),
+            "INCOMING|msg_id=%lld|chat_id=%d|from=%s|body=%s",
+            msg_id, chat_id, c->login, text);
+
+        /* Рассылаем через write_mutex каждого участника */
+        Client *grp_clients[MAX_MEMBERS];
+        int     grp_count = 0;
+
+        pthread_mutex_lock(&g_clients_mutex);
+        for (int i = 0; i < member_count; i++) {
+            if (strcmp(logins[i], c->login) == 0) continue;
+            Client *m = net_find_client(logins[i]);
+            if (m)
+                grp_clients[grp_count++] = m;
+        }
+        pthread_mutex_unlock(&g_clients_mutex);
+
+        int delivered = grp_count;
+        for (int i = 0; i < grp_count; i++)
+            client_send(grp_clients[i], incoming);
+
+        /* Помечаем недоставленные сообщения (оффлайн-участники) */
+        if (delivered < member_count - 1) {
+            sqlite3_stmt *upd = NULL;
+            if (sqlite3_prepare_v2(g_db,
+                    "UPDATE messages SET delivered=0 WHERE msg_id=?;",
+                    -1, &upd, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(upd, 1, msg_id);
+                sqlite3_step(upd);
+                sqlite3_finalize(upd);
+            }
+        }
+
+        snprintf(resp, sizeof(resp),
+            "OK|chat_id=%d|delivered=%d/%d", chat_id, delivered, member_count - 1);
+        goto send_resp;
+    }
+
+    /* ---- CHATS — список чатов пользователя -------------- */
+    if (strcmp(type, "CHATS") == 0) {
+        char *list = db_get_user_chats(c->login);
+        if (!list) {
+            snprintf(resp, sizeof(resp),
+                "ERR|code=%d|desc=Не удалось получить список чатов", ERR_BAD_FORMAT);
+            goto send_resp;
+        }
+        pthread_mutex_lock(&c->write_mutex);
+        fprintf(c->stream, "%s", list);
+        fflush(c->stream);
+        pthread_mutex_unlock(&c->write_mutex);
+        free(list);
+        return;
+    }
+
     snprintf(resp, sizeof(resp),
-        "ERR|code=%d|desc=Команда %s будет в следующем этапе", ERR_BAD_FORMAT, type);
+        "ERR|code=%d|desc=Неизвестная команда: %s", ERR_BAD_FORMAT, type);
 
 send_resp:
-    fprintf(c->stream, "%s\n", resp);
-    fflush(c->stream);
+    client_send(c, resp);
+}
+
+/* =========================================================
+ * client_send — потокобезопасная запись строки клиенту.
+ * Берёт write_mutex клиента, поэтому несколько потоков
+ * могут безопасно писать одному клиенту одновременно.
+ * ========================================================= */
+static void client_send(Client *c, const char *msg)
+{
+    pthread_mutex_lock(&c->write_mutex);
+    if (c->stream) {
+        fprintf(c->stream, "%s\n", msg);
+        fflush(c->stream);
+    }
+    pthread_mutex_unlock(&c->write_mutex);
 }
 
 /* =========================================================
@@ -270,8 +442,7 @@ void *net_client_thread(void *arg)
     }
 
     /* Приветствие клиенту */
-    fprintf(c->stream, "OK|info=Добро пожаловать! Ожидается AUTH или REG\n");
-    fflush(c->stream);
+    client_send(c, "OK|info=Добро пожаловать! Ожидается AUTH или REG");
 
     char buf[BUF_SIZE];
     while (fgets(buf, sizeof(buf), c->stream)) {
@@ -287,7 +458,8 @@ void *net_client_thread(void *arg)
 
     printf("Клиент отключился: %s\n", c->login[0] ? c->login : "?");
     net_remove_client(c);
-    fclose(c->stream); /* fclose закрывает и fd */
+    pthread_mutex_destroy(&c->write_mutex);
+    fclose(c->stream);
     free(c);
     return NULL;
 }
@@ -326,10 +498,5 @@ void net_remove_client(Client *c)
 
 void net_send(Client *c, const char *msg)
 {
-    pthread_mutex_lock(&g_clients_mutex);
-    if (c->stream) {
-        fprintf(c->stream, "%s\n", msg);
-        fflush(c->stream);
-    }
-    pthread_mutex_unlock(&g_clients_mutex);
+    client_send(c, msg);
 }
