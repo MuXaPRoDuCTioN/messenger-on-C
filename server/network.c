@@ -33,7 +33,6 @@ void server_log(const char *fmt, ...) {
     fprintf(log_file, "\n");
     fflush(log_file);
     
-    // Дублируем в консоль
     printf("[%s] ", timestamp);
     va_start(ap, fmt);
     vprintf(fmt, ap);
@@ -113,18 +112,25 @@ void send_msg(int fd, const char *msg) {
 void broadcast_to_chat(int chat_id, const char *msg, const char *exclude_login) {
     char **members;
     int count = db_get_chat_members(chat_id, &members);
+    
     pthread_mutex_lock(&online_mutex);
-    int sent = 0;
     for (int i = 0; i < count; i++) {
         if (exclude_login && strcmp(members[i], exclude_login) == 0) continue;
-        client_entry_t *e = find_by_login(members[i]);
+        
+        // ищем клиента вручную, так как мьютекс уже захвачен
+        client_entry_t *e = NULL;
+        for (client_entry_t *cur = online_head; cur; cur = cur->next) {
+            if (strcmp(cur->login, members[i]) == 0) {
+                e = cur;
+                break;
+            }
+        }
         if (e) {
             send_msg(e->fd, msg);
-            sent++;
         }
     }
     pthread_mutex_unlock(&online_mutex);
-    server_log("Broadcast to chat %d: %d online members received message", chat_id, sent);
+    
     db_free_members(members, count);
 }
 

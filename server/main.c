@@ -68,6 +68,7 @@ int main(void) {
     return 0;
 }
 
+// Чтение строки из сокета побайтово до \n
 static int read_line(int fd, char *buf, size_t size) {
     size_t i = 0;
     while (i < size - 1) {
@@ -86,6 +87,7 @@ static int read_line(int fd, char *buf, size_t size) {
     return i;
 }
 
+// Отправка строки в сокет
 static int send_line(int fd, const char *msg) {
     int len = strlen(msg);
     return send(fd, msg, len, 0);
@@ -100,6 +102,7 @@ static void *client_handler(void *arg) {
 
     server_log("Waiting for authentication on fd=%d", client_fd);
 
+    // Ожидаем AUTH или REG
     while (1) {
         int len = read_line(client_fd, line, sizeof(line));
         if (len < 0) {
@@ -165,6 +168,7 @@ static void *client_handler(void *arg) {
 
     add_online(login, client_fd, pthread_self());
 
+    // Отправляем недоставленные сообщения
     char **pending;
     int cnt = db_get_pending_messages(login, &pending);
     if (cnt > 0) {
@@ -177,6 +181,7 @@ static void *client_handler(void *arg) {
 
     server_log("User '%s' ready, entering command loop (fd=%d)", login, client_fd);
 
+    // Главный цикл команд
     while (1) {
         int len = read_line(client_fd, line, sizeof(line));
         if (len < 0) {
@@ -243,17 +248,29 @@ static void *client_handler(void *arg) {
                 server_log("Creating group '%s' with %d members by '%s'", name, mcnt, login);
                 int chat_id = db_create_group(name, marr, mcnt);
                 if (chat_id > 0) {
+                    // Сначала отвечаем создателю
+                    char ok[MAX_MSG_LINE];
+                    snprintf(ok, sizeof(ok), "OK|chat_id=%d\n", chat_id);
+                    send_line(client_fd, ok);
+
+                    // Рассылаем уведомления остальным участникам
                     char note[MAX_MSG_LINE];
                     build_msg(note, sizeof(note), CMD_OK,
                               "|action=group_created|chat_id=%d|name=%s",
                               chat_id, name);
-                    broadcast_to_chat(chat_id, note, NULL);
-                    char ok[MAX_MSG_LINE];
-                    snprintf(ok, sizeof(ok), "OK|chat_id=%d\n", chat_id);
-                    send_line(client_fd, ok);
+                    for (int i = 0; i < mcnt; i++) {
+                        if (strcmp(marr[i], login) == 0) continue;
+                        client_entry_t *receiver = find_by_login(marr[i]);
+                        if (receiver) {
+                            send_line(receiver->fd, note);
+                        }
+                    }
+                    server_log("Group '%s' created and notifications sent", name);
                 } else {
                     send_line(client_fd, "ERR|code=1|desc=Create failed\n");
                 }
+            } else {
+                send_line(client_fd, "ERR|code=1|desc=Bad format\n");
             }
         } else if (strcmp(cmd, CMD_HIST) == 0) {
             int chat_id;
@@ -300,7 +317,7 @@ static void *client_handler(void *arg) {
                 if (is_group) {
                     strncpy(display_name, chat_name ? chat_name : "Group", MAX_LOGIN-1);
                 } else {
-                    // Найти собеседника
+                    // Находим логин собеседника
                     sqlite3_stmt *stmt2;
                     sqlite3_prepare_v2(db, 
                         "SELECT user_login FROM chat_members WHERE chat_id=? AND user_login!=?",

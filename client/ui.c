@@ -50,7 +50,7 @@ void init_ui(void) {
     msg_win_w = w - chat_win_w;
 
     wattron(help_win, COLOR_PAIR(COLOR_INFO));
-    mvwprintw(help_win, 0, 0, "Commands: /msg <user> <text> | /list | /help | /quit");
+    mvwprintw(help_win, 0, 0, "Commands: /msg <user> <text> | /group <id> <text> | /list | /help | /quit");
     wattroff(help_win, COLOR_PAIR(COLOR_INFO));
 
     redraw_all();
@@ -80,7 +80,10 @@ void redraw_all(void) {
             wattron(chat_win, COLOR_PAIR(COLOR_HIGHLIGHT));
         else if (chat_list[i].is_group)
             wattron(chat_win, COLOR_PAIR(COLOR_GROUP));
-        mvwprintw(chat_win, y, 1, "%s", chat_list[i].name);
+        if (chat_list[i].is_group)
+            mvwprintw(chat_win, y, 1, "%s(%d)", chat_list[i].name, chat_list[i].chat_id);
+        else
+            mvwprintw(chat_win, y, 1, "%s", chat_list[i].name);
         if (i == active_chat_idx)
             wattroff(chat_win, COLOR_PAIR(COLOR_HIGHLIGHT));
         else if (chat_list[i].is_group)
@@ -110,7 +113,7 @@ void redraw_all(void) {
 
 void add_chat(int id, const char *name, int is_group) {
     for (int i = 0; i < chat_count; i++) {
-        if (strcmp(chat_list[i].name, name) == 0) {
+        if (strcmp(chat_list[i].name, name) == 0 && chat_list[i].is_group == is_group) {
             if (id > 0 && chat_list[i].chat_id != id) {
                 local_db_update_chat_id(chat_list[i].chat_id, id);
                 chat_list[i].chat_id = id;
@@ -213,6 +216,7 @@ void process_command(const char *cmd_line) {
             build_msg(sendline, sizeof(sendline), CMD_CREATE,
                       "|name=%s|members=%s", name, members);
             send_cmd(sendline);
+            // Группа добавится при получении OK|chat_id=... или group_created
         }
     } else if (strcmp(cmd, "list") == 0) {
         send_cmd("LIST\n");
@@ -318,7 +322,10 @@ void process_input(void) {
                                 wattron(chat_win, COLOR_PAIR(COLOR_HIGHLIGHT));
                             else if (chat_list[i].is_group)
                                 wattron(chat_win, COLOR_PAIR(COLOR_GROUP));
-                            mvwprintw(chat_win, y, 1, "%s", chat_list[i].name);
+                            if (chat_list[i].is_group)
+                                mvwprintw(chat_win, y, 1, "%s(%d)", chat_list[i].name, chat_list[i].chat_id);
+                            else
+                                mvwprintw(chat_win, y, 1, "%s", chat_list[i].name);
                             if (i == active_chat_idx)
                                 wattroff(chat_win, COLOR_PAIR(COLOR_HIGHLIGHT));
                             else if (chat_list[i].is_group)
@@ -348,6 +355,11 @@ void process_input(void) {
                 }
             } else if (strcmp(cmd, CMD_OK) == 0) {
                 int msg_id = -1;
+                int chat_id = -1;
+                if (get_param_int(msg, "chat_id", &chat_id) == 0) {
+                    // Ответ на CREATE, просто запрашиваем обновлённый список чатов
+                    send_cmd("GET_CHATS\n");
+                }
                 if (get_param_int(msg, "msg_id", &msg_id) == 0 && active_chat_idx >= 0) {
                     local_db_confirm_last_msg(chat_list[active_chat_idx].chat_id, msg_id);
                 }
@@ -385,14 +397,17 @@ void process_input(void) {
                                     wattron(chat_win, COLOR_PAIR(COLOR_HIGHLIGHT));
                                 else if (chat_list[i].is_group)
                                     wattron(chat_win, COLOR_PAIR(COLOR_GROUP));
-                                mvwprintw(chat_win, y, 1, "%s", chat_list[i].name);
+                                if (chat_list[i].is_group)
+                                    mvwprintw(chat_win, y, 1, "%s(%d)", chat_list[i].name, chat_list[i].chat_id);
+                                else
+                                    mvwprintw(chat_win, y, 1, "%s", chat_list[i].name);
                                 if (i == active_chat_idx)
                                     wattroff(chat_win, COLOR_PAIR(COLOR_HIGHLIGHT));
                                 else if (chat_list[i].is_group)
                                     wattroff(chat_win, COLOR_PAIR(COLOR_GROUP));
                             }
                             wrefresh(chat_win);
-                            if (active_chat_idx >= 0 && chat_list[active_chat_idx].chat_id == gid) {
+                            if (active_chat_idx < 0 || chat_list[active_chat_idx].chat_id != gid) {
                                 load_chat_history(gid);
                             }
                         }
@@ -435,7 +450,7 @@ void process_input(void) {
                 if (get_param_int(msg, "chat_id", &chat_id) == 0 &&
                     get_param(msg, "name", name, sizeof(name)) == 0) {
                     get_param_int(msg, "is_group", &is_group);
-                    // Имя теперь всегда приходит правильное с сервера
+                    // Добавляем или обновляем чат (add_chat обновит id и имя, если чат уже есть)
                     add_chat(chat_id, name, is_group);
                     // Запрашиваем историю этого чата
                     char req[MAX_MSG_LINE];
@@ -453,7 +468,10 @@ void process_input(void) {
                         wattron(chat_win, COLOR_PAIR(COLOR_HIGHLIGHT));
                     else if (chat_list[i].is_group)
                         wattron(chat_win, COLOR_PAIR(COLOR_GROUP));
-                    mvwprintw(chat_win, y, 1, "%s", chat_list[i].name);
+                    if (chat_list[i].is_group)
+                        mvwprintw(chat_win, y, 1, "%s(%d)", chat_list[i].name, chat_list[i].chat_id);
+                    else
+                        mvwprintw(chat_win, y, 1, "%s", chat_list[i].name);
                     if (i == active_chat_idx)
                         wattroff(chat_win, COLOR_PAIR(COLOR_HIGHLIGHT));
                     else if (chat_list[i].is_group)
@@ -489,7 +507,10 @@ void process_input(void) {
                                     wattron(chat_win, COLOR_PAIR(COLOR_HIGHLIGHT));
                                 else if (chat_list[i].is_group)
                                     wattron(chat_win, COLOR_PAIR(COLOR_GROUP));
-                                mvwprintw(chat_win, y, 1, "%s", chat_list[i].name);
+                                if (chat_list[i].is_group)
+                                    mvwprintw(chat_win, y, 1, "%s(%d)", chat_list[i].name, chat_list[i].chat_id);
+                                else
+                                    mvwprintw(chat_win, y, 1, "%s", chat_list[i].name);
                                 if (i == active_chat_idx)
                                     wattroff(chat_win, COLOR_PAIR(COLOR_HIGHLIGHT));
                                 else if (chat_list[i].is_group)
@@ -580,7 +601,10 @@ void process_input(void) {
                             wattron(chat_win, COLOR_PAIR(COLOR_HIGHLIGHT));
                         else if (chat_list[i].is_group)
                             wattron(chat_win, COLOR_PAIR(COLOR_GROUP));
-                        mvwprintw(chat_win, y, 1, "%s", chat_list[i].name);
+                        if (chat_list[i].is_group)
+                            mvwprintw(chat_win, y, 1, "%s(%d)", chat_list[i].name, chat_list[i].chat_id);
+                        else
+                            mvwprintw(chat_win, y, 1, "%s", chat_list[i].name);
                         if (i == active_chat_idx)
                             wattroff(chat_win, COLOR_PAIR(COLOR_HIGHLIGHT));
                         else if (chat_list[i].is_group)
