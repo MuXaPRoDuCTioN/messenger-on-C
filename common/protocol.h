@@ -1,42 +1,94 @@
 #ifndef PROTOCOL_H
 #define PROTOCOL_H
 
-/* =========================================================
- * Общий протокол мессенджера
- * Формат сообщений: ТИП|ключ=значение|ключ=значение\n
- * Пример: AUTH|login=vasya|pass=123456\n
- * ========================================================= */
+#include <stdio.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdlib.h>
 
-#define PORT_DEFAULT    8080
-#define BUF_SIZE        4096
-#define MAX_LOGIN       64
-#define MAX_TEXT        2048
-#define MAX_CHAT_NAME   128
-#define MAX_MEMBERS     64
+// Типы сообщений
+#define CMD_AUTH      "AUTH"
+#define CMD_REG       "REG"
+#define CMD_MSG       "MSG"
+#define CMD_GRP       "GRP"
+#define CMD_REPLY     "REPLY"
+#define CMD_FWD       "FWD"
+#define CMD_HIST      "HIST"
+#define CMD_CREATE    "CREATE"
+#define CMD_OK        "OK"
+#define CMD_ERR       "ERR"
+#define CMD_LIST      "LIST"
+#define CMD_HELP      "HELP"
+#define CMD_GET_CHATS "GET_CHATS"
 
-/* Типы сообщений клиент → сервер */
-#define MSG_AUTH        "AUTH"   /* AUTH|login=...|pass=...          */
-#define MSG_REG         "REG"    /* REG|login=...|pass=...           */
-#define MSG_SEND        "MSG"    /* MSG|to=...|text=...              */
-#define MSG_GRP         "GRP"    /* GRP|chat_id=...|text=...         */
-#define MSG_REPLY       "REPLY"  /* REPLY|...|reply_to=<id>          */
-#define MSG_FWD         "FWD"    /* FWD|...|fwd_from=<chat_id>       */
-#define MSG_HIST        "HIST"   /* HIST|chat_id=...                 */
-#define MSG_CREATE      "CREATE" /* CREATE|name=...|members=a,b,c    */
-#define MSG_CHATS       "CHATS"  /* CHATS  — список своих чатов      */
+// Коды ошибок
+#define ERR_FORMAT   1
+#define ERR_NOUSER   2
+#define ERR_OFFLINE  3
+#define ERR_ACCESS   4
 
-/* Типы сообщений сервер → клиент */
-#define RESP_OK              "OK"
-#define RESP_ERR             "ERR"
-#define RESP_INCOMING        "INCOMING"       /* Входящее сообщение         */
-#define RESP_CHATLIST_UPDATE "CHATLIST_UPDATE" /* Добавлен в новый чат       */
+// Ограничения
+#define MAX_LOGIN     32
+#define MAX_PASS      64
+#define MAX_BODY     1024
+#define MAX_MSG_LINE 2048
+#define MAX_CMD_LEN   16
 
-/* Коды ошибок */
-#define ERR_BAD_FORMAT  1   /* Неверный формат сообщения   */
-#define ERR_NOT_FOUND   2   /* Пользователь не найден      */
-#define ERR_OFFLINE     3   /* Адресат не в сети           */
-#define ERR_FORBIDDEN   4   /* Доступ к чату запрещён      */
-#define ERR_EXISTS      5   /* Пользователь уже существует */
-#define ERR_WRONG_PASS  6   /* Неверный пароль             */
+// Порт по умолчанию
+#define DEFAULT_PORT 12345
 
-#endif /* PROTOCOL_H */
+static inline int build_msg(char *buf, size_t size, const char *cmd,
+                            const char *fmt, ...) {
+    int len = snprintf(buf, size, "%s", cmd);
+    if (len < 0 || (size_t)len >= size) return -1;
+    if (fmt && fmt[0]) {
+        va_list ap;
+        va_start(ap, fmt);
+        int add = vsnprintf(buf + len, size - len, fmt, ap);
+        va_end(ap);
+        if (add < 0 || (size_t)(len + add) >= size) return -1;
+        len += add;
+    }
+    if ((size_t)len + 1 < size) {
+        buf[len++] = '\n';
+        buf[len] = '\0';
+    } else {
+        return -1;
+    }
+    return len;
+}
+
+static inline int get_param(const char *msg, const char *key,
+                            char *value, size_t val_size) {
+    char search[64];
+    snprintf(search, sizeof(search), "%s=", key);
+    const char *start = strstr(msg, search);
+    if (!start) return -1;
+    start += strlen(search);
+    const char *end = strpbrk(start, "|\n\r");
+    size_t len = end ? (size_t)(end - start) : strlen(start);
+    if (len >= val_size) len = val_size - 1;
+    memcpy(value, start, len);
+    value[len] = '\0';
+    return 0;
+}
+
+static inline int get_param_int(const char *msg, const char *key, int *val) {
+    char buf[32];
+    if (get_param(msg, key, buf, sizeof(buf)) == 0) {
+        *val = atoi(buf);
+        return 0;
+    }
+    return -1;
+}
+
+static inline void get_cmd(const char *msg, char *cmd, size_t size) {
+    const char *end = strchr(msg, '|');
+    size_t len = end ? (size_t)(end - msg) : strlen(msg);
+    if (len > 0 && (msg[len-1] == '\n' || msg[len-1] == '\r')) len--;
+    if (len >= size) len = size - 1;
+    memcpy(cmd, msg, len);
+    cmd[len] = '\0';
+}
+
+#endif

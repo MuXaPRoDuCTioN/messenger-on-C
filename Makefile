@@ -1,30 +1,29 @@
-CC      = gcc
-CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic -g \
-           -I./common -I./server -I./client
-LDFLAGS = -lpthread
+CC = gcc
+CFLAGS = -Wall -Wextra -std=c11 -pthread -D_POSIX_C_SOURCE=200809L
+LDFLAGS = -lncurses -lsqlite3
 
-# SQLite подключён на этапе 3; ncurses добавим на этапе 7:
-LDFLAGS += -lsqlite3
-# LDFLAGS += -lncurses
+COMMON_DIR = common
+SERVER_DIR = server
+CLIENT_DIR = client
 
-SRV_SRCS = server/main.c server/network.c server/db.c
-CLI_SRCS = client/main.c client/network.c client/ui.c
+SERVER_SRCS = $(SERVER_DIR)/main.c $(SERVER_DIR)/network.c $(SERVER_DIR)/db.c
+SERVER_OBJS = $(SERVER_SRCS:.c=.o)
 
-SRV_OBJS = $(SRV_SRCS:.c=.o)
-CLI_OBJS = $(CLI_SRCS:.c=.o)
+CLIENT_SRCS = $(CLIENT_DIR)/main.c $(CLIENT_DIR)/network.c $(CLIENT_DIR)/ui.c $(CLIENT_DIR)/local_db.c
+CLIENT_OBJS = $(CLIENT_SRCS:.c=.o)
 
-.PHONY: all clean server client
+.PHONY: all clean
 
-all: server client
+all: server_app client_app
 
-server: $(SRV_OBJS)
-	$(CC) $(CFLAGS) -o server_app $^ $(LDFLAGS)
+server_app: $(SERVER_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-client: $(CLI_OBJS)
-	$(CC) $(CFLAGS) -o client_app $^ $(LDFLAGS)
+client_app: $(CLIENT_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -I$(COMMON_DIR) -I$(SERVER_DIR) -I$(CLIENT_DIR) -c $< -o $@
 
 clean:
-	rm -f server/**.o client/**.o server_app client_app
+	rm -f $(SERVER_OBJS) $(CLIENT_OBJS) server_app client_app
