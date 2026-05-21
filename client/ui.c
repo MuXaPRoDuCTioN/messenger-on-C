@@ -20,9 +20,13 @@ static int input_len = 0;
 
 static int cur_msg_y = 0;
 
-enum { COLOR_MY_MSG = 1, COLOR_OTHER_MSG, COLOR_HIGHLIGHT, COLOR_GROUP, COLOR_INFO };
+enum { COLOR_MY_MSG = 1, COLOR_OTHER_MSG, COLOR_HIGHLIGHT, COLOR_GROUP, COLOR_INFO, COLOR_ID };
 
 static void load_chat_history(int chat_id);
+static void print_msg_line(const char *sender, const char *body, int local_id, int is_me);
+static void sanitize_body(char *dest, const char *src, size_t dest_size);
+static int find_chat_idx_by_name(const char *name);
+static int is_number(const char *str);
 
 void init_ui(void) {
     initscr();
@@ -35,6 +39,7 @@ void init_ui(void) {
     init_pair(COLOR_HIGHLIGHT, COLOR_CYAN, COLOR_BLACK);
     init_pair(COLOR_GROUP, COLOR_YELLOW, COLOR_BLACK);
     init_pair(COLOR_INFO, COLOR_MAGENTA, COLOR_BLACK);
+    init_pair(COLOR_ID, COLOR_BLACK, COLOR_WHITE);
 
     int h = LINES - 2, w = COLS;
     chat_win_w = w / 4;
@@ -50,7 +55,7 @@ void init_ui(void) {
     msg_win_w = w - chat_win_w;
 
     wattron(help_win, COLOR_PAIR(COLOR_INFO));
-    mvwprintw(help_win, 0, 0, "Commands: /msg <user> <text> | /group <id> <text> | /list | /help | /quit");
+    mvwprintw(help_win, 0, 0, "/msg /group /reply /fwd /create /list /help /quit");
     wattroff(help_win, COLOR_PAIR(COLOR_INFO));
 
     redraw_all();
@@ -99,7 +104,7 @@ void redraw_all(void) {
 
     wattron(help_win, COLOR_PAIR(COLOR_INFO));
     if (show_help) {
-        mvwprintw(help_win, 0, 0, "Commands: /msg /group /create /list /help /quit | TAB/Arrows: navigate");
+        mvwprintw(help_win, 0, 0, "/msg /group /reply /fwd /create /list /help /quit | TAB/Arrows");
     } else {
         mvwprintw(help_win, 0, 0, "Type /help for commands | F1: quit | TAB: switch chat");
     }
@@ -127,10 +132,44 @@ void add_chat(int id, const char *name, int is_group) {
         strncpy(chat_list[chat_count].name, name, MAX_LOGIN-1);
         chat_list[chat_count].name[MAX_LOGIN-1] = '\0';
         chat_list[chat_count].is_group = is_group;
+        chat_list[chat_count].msg_count = 0;
         chat_count++;
         if (active_chat_idx < 0) active_chat_idx = 0;
         local_db_add_chat(id, name, is_group);
     }
+}
+
+static int find_chat_idx_by_name(const char *name) {
+    for (int i = 0; i < chat_count; i++) {
+        if (strcmp(chat_list[i].name, name) == 0 && !chat_list[i].is_group)
+            return i;
+    }
+    return -1;
+}
+
+static int is_number(const char *str) {
+    if (!str || !*str) return 0;
+    for (const char *p = str; *p; p++) {
+        if (*p < '0' || *p > '9') return 0;
+    }
+    return 1;
+}
+
+static void sanitize_body(char *dest, const char *src, size_t dest_size) {
+    const char *p = src;
+    char *q = dest;
+    while (*p && (size_t)(q - dest) < dest_size - 1) {
+        if (*p == '|') {
+            *q++ = ';';
+            p++;
+        } else if (*p == '\n') {
+            *q++ = ' ';
+            p++;
+        } else {
+            *q++ = *p++;
+        }
+    }
+    *q = '\0';
 }
 
 void process_command(const char *cmd_line) {
@@ -170,20 +209,22 @@ void process_command(const char *cmd_line) {
                 }
             }
             add_chat(existing_id, user, 0);
+            char clean_text[MAX_BODY];
+            sanitize_body(clean_text, text, sizeof(clean_text));
             char sendline[MAX_MSG_LINE];
             build_msg(sendline, sizeof(sendline), CMD_MSG,
-                      "|to=%s|text=%s", user, text);
+                      "|to=%s|text=%s", user, clean_text);
             send_cmd(sendline);
-            local_db_save_msg(existing_id, my_login, -1, text);
+            local_db_save_msg(existing_id, my_login, -1, clean_text);
 
             if (active_chat_idx >= 0 && strcmp(chat_list[active_chat_idx].name, user) == 0) {
+                chat_list[active_chat_idx].msg_count++;
+                int new_id = chat_list[active_chat_idx].msg_count;
                 if (cur_msg_y >= msg_win_h - 1) {
                     scroll(msg_win);
                     cur_msg_y = msg_win_h - 2;
                 }
-                wattron(msg_win, COLOR_PAIR(COLOR_MY_MSG));
-                mvwprintw(msg_win, ++cur_msg_y, 1, "[%s]: %s", my_login, text);
-                wattroff(msg_win, COLOR_PAIR(COLOR_MY_MSG));
+                print_msg_line(my_login, clean_text, new_id, 1);
                 wrefresh(msg_win);
             }
         }
@@ -192,20 +233,207 @@ void process_command(const char *cmd_line) {
         char *text = strtok_r(NULL, "", &saveptr);
         if (id_str && text) {
             int gid = atoi(id_str);
+            char clean_text[MAX_BODY];
+            sanitize_body(clean_text, text, sizeof(clean_text));
             char sendline[MAX_MSG_LINE];
             build_msg(sendline, sizeof(sendline), CMD_GRP,
-                      "|chat_id=%d|text=%s", gid, text);
+                      "|chat_id=%d|text=%s", gid, clean_text);
             send_cmd(sendline);
-            local_db_save_msg(gid, my_login, -1, text);
+            local_db_save_msg(gid, my_login, -1, clean_text);
             if (active_chat_idx >= 0 && chat_list[active_chat_idx].chat_id == gid) {
+                chat_list[active_chat_idx].msg_count++;
+                int new_id = chat_list[active_chat_idx].msg_count;
                 if (cur_msg_y >= msg_win_h - 1) {
                     scroll(msg_win);
                     cur_msg_y = msg_win_h - 2;
                 }
-                wattron(msg_win, COLOR_PAIR(COLOR_MY_MSG));
-                mvwprintw(msg_win, ++cur_msg_y, 1, "[%s]: %s", my_login, text);
-                wattroff(msg_win, COLOR_PAIR(COLOR_MY_MSG));
+                print_msg_line(my_login, clean_text, new_id, 1);
                 wrefresh(msg_win);
+            }
+        }
+    } else if (strcmp(cmd, "reply") == 0) {
+        char *msg_id_str = strtok_r(NULL, " ", &saveptr);
+        char *text = strtok_r(NULL, "", &saveptr);
+        if (msg_id_str && text) {
+            int reply_to = atoi(msg_id_str);
+            if (active_chat_idx < 0) return;
+            chat_entry_t *chat = &chat_list[active_chat_idx];
+
+            // Получаем исходное сообщение по локальному номеру
+            char **senders, **bodies;
+            int *msg_ids;
+            int count = local_db_get_messages(chat->chat_id, &senders, &bodies, &msg_ids, 200);
+            char quoted[MAX_BODY] = "";
+            int found = 0;
+            if (reply_to > 0 && reply_to <= count) {
+                int idx = reply_to - 1;
+                strncpy(quoted, bodies[idx], MAX_BODY-1);
+                found = 1;
+            }
+            local_db_free_messages(count, senders, bodies, msg_ids);
+
+            char full_text[MAX_BODY * 2] = "";
+            if (found) {
+                char clean_quoted[MAX_BODY];
+                sanitize_body(clean_quoted, quoted, sizeof(clean_quoted));
+                char clean_text[MAX_BODY];
+                sanitize_body(clean_text, text, sizeof(clean_text));
+                snprintf(full_text, sizeof(full_text), "> %s; %s", clean_quoted, clean_text);
+            } else {
+                char clean_text[MAX_BODY];
+                sanitize_body(clean_text, text, sizeof(clean_text));
+                snprintf(full_text, sizeof(full_text), "%s", clean_text);
+            }
+            if (strlen(full_text) >= MAX_BODY) full_text[MAX_BODY-1] = '\0';
+
+            if (chat->is_group) {
+                // Групповой чат: отправляем как GRP
+                char sendline[MAX_MSG_LINE];
+                build_msg(sendline, sizeof(sendline), CMD_GRP,
+                          "|chat_id=%d|text=%s", chat->chat_id, full_text);
+                send_cmd(sendline);
+            } else {
+                // Личный чат: используем REPLY
+                char sendline[MAX_MSG_LINE];
+                if (build_msg(sendline, sizeof(sendline), CMD_REPLY,
+                              "|to=%s|text=%s|reply_to=%d",
+                              chat->name, full_text, reply_to) < 0) {
+                    build_msg(sendline, sizeof(sendline), CMD_REPLY,
+                              "|to=%s|text=%s|reply_to=%d",
+                              chat->name, text, reply_to);
+                }
+                send_cmd(sendline);
+            }
+            local_db_save_msg(chat->chat_id, my_login, -1, full_text);
+            chat->msg_count++;
+            int new_id = chat->msg_count;
+            if (cur_msg_y >= msg_win_h - 1) {
+                scroll(msg_win);
+                cur_msg_y = msg_win_h - 2;
+            }
+            print_msg_line(my_login, full_text, new_id, 1);
+            wrefresh(msg_win);
+        }
+    } else if (strcmp(cmd, "fwd") == 0) {
+        char *to = strtok_r(NULL, " ", &saveptr);
+        char *msg_id_str = strtok_r(NULL, " ", &saveptr);
+        char *text = strtok_r(NULL, "", &saveptr);
+        if (to && msg_id_str) {
+            int fwd_id = atoi(msg_id_str);
+            if (!text || strlen(text) == 0) text = "(forwarded)";
+
+            if (active_chat_idx < 0) return;
+            chat_entry_t *chat = &chat_list[active_chat_idx];
+            int src_chat = chat->chat_id;
+
+            // Ищем исходное сообщение по локальному номеру
+            char **senders, **bodies;
+            int *msg_ids;
+            int count = local_db_get_messages(src_chat, &senders, &bodies, &msg_ids, 200);
+            char quoted[MAX_BODY] = "";
+            char orig_sender[MAX_LOGIN] = "unknown";
+            int found_src = 0;
+            if (fwd_id > 0 && fwd_id <= count) {
+                int idx = fwd_id - 1;
+                strncpy(orig_sender, senders[idx], MAX_LOGIN-1);
+                strncpy(quoted, bodies[idx], MAX_BODY-1);
+                found_src = 1;
+            }
+            local_db_free_messages(count, senders, bodies, msg_ids);
+
+            char full_text[MAX_BODY * 2] = "";
+            if (found_src) {
+                char clean_quoted[MAX_BODY];
+                sanitize_body(clean_quoted, quoted, sizeof(clean_quoted));
+                char clean_text[MAX_BODY];
+                sanitize_body(clean_text, text, sizeof(clean_text));
+                snprintf(full_text, sizeof(full_text), "[from %s] > %s; %s", orig_sender, clean_quoted, clean_text);
+            } else {
+                char clean_text[MAX_BODY];
+                sanitize_body(clean_text, text, sizeof(clean_text));
+                snprintf(full_text, sizeof(full_text), "[from unknown] %s", clean_text);
+            }
+            if (strlen(full_text) >= MAX_BODY) full_text[MAX_BODY-1] = '\0';
+
+            if (is_number(to)) {
+                // Пересылка в группу по chat_id
+                int gid = atoi(to);
+                char sendline[MAX_MSG_LINE];
+                build_msg(sendline, sizeof(sendline), CMD_GRP,
+                          "|chat_id=%d|text=%s", gid, full_text);
+                send_cmd(sendline);
+                local_db_save_msg(gid, my_login, -1, full_text);
+
+                // Если сейчас находимся в этой группе, показываем сообщение
+                if (active_chat_idx >= 0 && chat_list[active_chat_idx].chat_id == gid) {
+                    chat->msg_count++;
+                    int new_id = chat->msg_count;
+                    if (cur_msg_y >= msg_win_h - 1) {
+                        scroll(msg_win);
+                        cur_msg_y = msg_win_h - 2;
+                    }
+                    print_msg_line(my_login, full_text, new_id, 1);
+                    wrefresh(msg_win);
+                } else {
+                    // Иначе просто уведомление
+                    if (cur_msg_y >= msg_win_h - 1) {
+                        scroll(msg_win);
+                        cur_msg_y = msg_win_h - 2;
+                    }
+                    wattron(msg_win, COLOR_PAIR(COLOR_INFO));
+                    mvwprintw(msg_win, ++cur_msg_y, 1, "Forwarded to group %d.", gid);
+                    wattroff(msg_win, COLOR_PAIR(COLOR_INFO));
+                    wrefresh(msg_win);
+                }
+            } else {
+                // Пересылка пользователю (личный чат)
+                char sendline[MAX_MSG_LINE];
+                if (build_msg(sendline, sizeof(sendline), CMD_FWD,
+                              "|to=%s|text=%s|fwd_from=%d",
+                              to, full_text, fwd_id) < 0) {
+                    build_msg(sendline, sizeof(sendline), CMD_FWD,
+                              "|to=%s|text=%s|fwd_from=%d", to, text, fwd_id);
+                }
+                send_cmd(sendline);
+
+                add_chat(-1, to, 0);
+                int target_idx = find_chat_idx_by_name(to);
+                if (target_idx >= 0) {
+                    active_chat_idx = target_idx;
+                    chat_entry_t *target = &chat_list[active_chat_idx];
+                    target->msg_count++;
+                    int new_id = target->msg_count;
+                    local_db_save_msg(target->chat_id, my_login, -1, full_text);
+                    load_chat_history(target->chat_id);
+                    cur_msg_y = target->msg_count;
+                    if (cur_msg_y >= msg_win_h - 1) {
+                        scroll(msg_win);
+                        cur_msg_y = msg_win_h - 2;
+                    }
+                    print_msg_line(my_login, full_text, new_id, 1);
+                    wrefresh(msg_win);
+                    // Обновляем панель
+                    werase(chat_win);
+                    box(chat_win, 0, 0);
+                    mvwprintw(chat_win, 0, 1, "Chats (%d)", chat_count);
+                    for (int i = 0; i < chat_count; i++) {
+                        int y = i + 1;
+                        if (y >= msg_win_h) break;
+                        if (i == active_chat_idx)
+                            wattron(chat_win, COLOR_PAIR(COLOR_HIGHLIGHT));
+                        else if (chat_list[i].is_group)
+                            wattron(chat_win, COLOR_PAIR(COLOR_GROUP));
+                        if (chat_list[i].is_group)
+                            mvwprintw(chat_win, y, 1, "%s(%d)", chat_list[i].name, chat_list[i].chat_id);
+                        else
+                            mvwprintw(chat_win, y, 1, "%s", chat_list[i].name);
+                        if (i == active_chat_idx)
+                            wattroff(chat_win, COLOR_PAIR(COLOR_HIGHLIGHT));
+                        else if (chat_list[i].is_group)
+                            wattroff(chat_win, COLOR_PAIR(COLOR_GROUP));
+                    }
+                    wrefresh(chat_win);
+                }
             }
         }
     } else if (strcmp(cmd, "create") == 0) {
@@ -216,7 +444,6 @@ void process_command(const char *cmd_line) {
             build_msg(sendline, sizeof(sendline), CMD_CREATE,
                       "|name=%s|members=%s", name, members);
             send_cmd(sendline);
-            // Группа добавится при получении OK|chat_id=... или group_created
         }
     } else if (strcmp(cmd, "list") == 0) {
         send_cmd("LIST\n");
@@ -225,7 +452,7 @@ void process_command(const char *cmd_line) {
         werase(help_win);
         wattron(help_win, COLOR_PAIR(COLOR_INFO));
         if (show_help) {
-            mvwprintw(help_win, 0, 0, "Commands: /msg /group /create /list /help /quit | TAB/Arrows: navigate");
+            mvwprintw(help_win, 0, 0, "/msg /group /reply /fwd /create /list /help /quit | TAB/Arrows");
         } else {
             mvwprintw(help_win, 0, 0, "Type /help for commands | F1: quit | TAB: switch chat");
         }
@@ -236,32 +463,56 @@ void process_command(const char *cmd_line) {
     }
 }
 
+static void print_msg_line(const char *sender, const char *body, int local_id, int is_me) {
+    char clean_body[MAX_BODY];
+    const char *src = body;
+    char *dst = clean_body;
+    while (*src && (dst - clean_body) < (int)(sizeof(clean_body)-1)) {
+        if (*src == '\n') {
+            *dst++ = ' ';
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+
+    if (cur_msg_y >= msg_win_h - 1) {
+        scroll(msg_win);
+        cur_msg_y = msg_win_h - 2;
+    }
+    wattron(msg_win, COLOR_PAIR(COLOR_ID));
+    mvwprintw(msg_win, ++cur_msg_y, 1, "[%d]", local_id);
+    wattroff(msg_win, COLOR_PAIR(COLOR_ID));
+    if (is_me) {
+        wattron(msg_win, COLOR_PAIR(COLOR_MY_MSG));
+    } else {
+        wattron(msg_win, COLOR_PAIR(COLOR_OTHER_MSG));
+    }
+    mvwprintw(msg_win, cur_msg_y, 6, "[%s]: %s", sender, clean_body);
+    if (is_me) {
+        wattroff(msg_win, COLOR_PAIR(COLOR_MY_MSG));
+    } else {
+        wattroff(msg_win, COLOR_PAIR(COLOR_OTHER_MSG));
+    }
+}
+
 static void load_chat_history(int chat_id) {
     if (chat_id < 0) return;
     char **senders, **bodies;
-    int count = local_db_get_messages(chat_id, &senders, &bodies, 200);
+    int *msg_ids;
+    int count = local_db_get_messages(chat_id, &senders, &bodies, &msg_ids, 200);
     werase(msg_win);
     box(msg_win, 0, 0);
     if (active_chat_idx >= 0) {
         mvwprintw(msg_win, 0, 1, "Chat: %s", chat_list[active_chat_idx].name);
+        chat_list[active_chat_idx].msg_count = count;
     }
     cur_msg_y = 1;
     for (int i = 0; i < count; i++) {
-        if (cur_msg_y >= msg_win_h - 1) break;
-        if (strcmp(senders[i], my_login) == 0) {
-            wattron(msg_win, COLOR_PAIR(COLOR_MY_MSG));
-        } else {
-            wattron(msg_win, COLOR_PAIR(COLOR_OTHER_MSG));
-        }
-        mvwprintw(msg_win, cur_msg_y, 1, "[%s]: %s", senders[i], bodies[i]);
-        if (strcmp(senders[i], my_login) == 0) {
-            wattroff(msg_win, COLOR_PAIR(COLOR_MY_MSG));
-        } else {
-            wattroff(msg_win, COLOR_PAIR(COLOR_OTHER_MSG));
-        }
-        cur_msg_y++;
+        int is_me = (strcmp(senders[i], my_login) == 0);
+        print_msg_line(senders[i], bodies[i], i+1, is_me);
     }
-    local_db_free_messages(count, senders, bodies);
+    local_db_free_messages(count, senders, bodies, msg_ids);
     wrefresh(msg_win);
 }
 
@@ -295,10 +546,13 @@ void process_input(void) {
                 strcmp(cmd, CMD_REPLY) == 0 || strcmp(cmd, CMD_FWD) == 0) {
                 char from[MAX_LOGIN], body[MAX_BODY];
                 int chat_id, msg_id = -1;
+                int reply_to = -1, fwd_from = -1;
                 if (get_param(msg, "from", from, sizeof(from)) == 0 &&
                     get_param_int(msg, "chat_id", &chat_id) == 0 &&
                     get_param(msg, "text", body, sizeof(body)) == 0) {
                     get_param_int(msg, "msg_id", &msg_id);
+                    get_param_int(msg, "reply_to", &reply_to);
+                    get_param_int(msg, "fwd_from", &fwd_from);
 
                     if (strcmp(from, my_login) == 0) {
                         local_db_confirm_last_msg(chat_id, msg_id);
@@ -335,21 +589,10 @@ void process_input(void) {
                     }
 
                     if (active_chat_idx >= 0 && chat_list[active_chat_idx].chat_id == chat_id) {
-                        if (cur_msg_y >= msg_win_h - 1) {
-                            scroll(msg_win);
-                            cur_msg_y = msg_win_h - 2;
-                        }
-                        if (strcmp(from, my_login) == 0) {
-                            wattron(msg_win, COLOR_PAIR(COLOR_MY_MSG));
-                        } else {
-                            wattron(msg_win, COLOR_PAIR(COLOR_OTHER_MSG));
-                        }
-                        mvwprintw(msg_win, ++cur_msg_y, 1, "[%s]: %s", from, body);
-                        if (strcmp(from, my_login) == 0) {
-                            wattroff(msg_win, COLOR_PAIR(COLOR_MY_MSG));
-                        } else {
-                            wattroff(msg_win, COLOR_PAIR(COLOR_OTHER_MSG));
-                        }
+                        chat_list[active_chat_idx].msg_count++;
+                        int local_id = chat_list[active_chat_idx].msg_count;
+                        int is_me = (strcmp(from, my_login) == 0);
+                        print_msg_line(from, body, local_id, is_me);
                         wrefresh(msg_win);
                     }
                 }
@@ -357,7 +600,6 @@ void process_input(void) {
                 int msg_id = -1;
                 int chat_id = -1;
                 if (get_param_int(msg, "chat_id", &chat_id) == 0) {
-                    // Ответ на CREATE, просто запрашиваем обновлённый список чатов
                     send_cmd("GET_CHATS\n");
                 }
                 if (get_param_int(msg, "msg_id", &msg_id) == 0 && active_chat_idx >= 0) {
@@ -450,14 +692,11 @@ void process_input(void) {
                 if (get_param_int(msg, "chat_id", &chat_id) == 0 &&
                     get_param(msg, "name", name, sizeof(name)) == 0) {
                     get_param_int(msg, "is_group", &is_group);
-                    // Добавляем или обновляем чат (add_chat обновит id и имя, если чат уже есть)
                     add_chat(chat_id, name, is_group);
-                    // Запрашиваем историю этого чата
                     char req[MAX_MSG_LINE];
                     build_msg(req, sizeof(req), CMD_HIST, "|chat_id=%d", chat_id);
                     send_cmd(req);
                 }
-                // Обновляем панель чатов
                 werase(chat_win);
                 box(chat_win, 0, 0);
                 mvwprintw(chat_win, 0, 1, "Chats (%d)", chat_count);
@@ -489,7 +728,11 @@ void process_input(void) {
                     char *body = strtok_r(NULL, "", &saveptr);
                     if (sender && msg_id_str && body) {
                         int msg_id = atoi(msg_id_str);
-                        local_db_save_msg(chat_id, sender, msg_id, body);
+                        if (strcmp(sender, my_login) == 0) {
+                            local_db_confirm_last_msg(chat_id, msg_id);
+                        } else {
+                            local_db_save_msg(chat_id, sender, msg_id, body);
+                        }
 
                         int found = 0;
                         for (int i = 0; i < chat_count; i++) {
@@ -519,7 +762,6 @@ void process_input(void) {
                             wrefresh(chat_win);
                         }
 
-                        // Перерисовка истории активного чата
                         if (active_chat_idx >= 0 && chat_list[active_chat_idx].chat_id == chat_id) {
                             load_chat_history(chat_id);
                         }
@@ -540,23 +782,25 @@ void process_input(void) {
                             process_command(input_buf);
                         } else if (active_chat_idx >= 0) {
                             chat_entry_t *chat = &chat_list[active_chat_idx];
+                            char clean_text[MAX_BODY];
+                            sanitize_body(clean_text, input_buf, sizeof(clean_text));
                             char sendline[MAX_MSG_LINE];
                             if (chat->is_group)
                                 build_msg(sendline, sizeof(sendline), CMD_GRP,
-                                          "|chat_id=%d|text=%s", chat->chat_id, input_buf);
+                                          "|chat_id=%d|text=%s", chat->chat_id, clean_text);
                             else
                                 build_msg(sendline, sizeof(sendline), CMD_MSG,
-                                          "|to=%s|text=%s", chat->name, input_buf);
+                                          "|to=%s|text=%s", chat->name, clean_text);
                             send_cmd(sendline);
-                            local_db_save_msg(chat->chat_id, my_login, -1, input_buf);
+                            local_db_save_msg(chat->chat_id, my_login, -1, clean_text);
 
+                            chat->msg_count++;
+                            int new_id = chat->msg_count;
                             if (cur_msg_y >= msg_win_h - 1) {
                                 scroll(msg_win);
                                 cur_msg_y = msg_win_h - 2;
                             }
-                            wattron(msg_win, COLOR_PAIR(COLOR_MY_MSG));
-                            mvwprintw(msg_win, ++cur_msg_y, 1, "[%s]: %s", my_login, input_buf);
-                            wattroff(msg_win, COLOR_PAIR(COLOR_MY_MSG));
+                            print_msg_line(my_login, clean_text, new_id, 1);
                             wrefresh(msg_win);
                         }
                         input_len = 0;

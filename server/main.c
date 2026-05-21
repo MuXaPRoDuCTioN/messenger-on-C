@@ -68,7 +68,6 @@ int main(void) {
     return 0;
 }
 
-// Чтение строки из сокета побайтово до \n
 static int read_line(int fd, char *buf, size_t size) {
     size_t i = 0;
     while (i < size - 1) {
@@ -87,7 +86,6 @@ static int read_line(int fd, char *buf, size_t size) {
     return i;
 }
 
-// Отправка строки в сокет
 static int send_line(int fd, const char *msg) {
     int len = strlen(msg);
     return send(fd, msg, len, 0);
@@ -102,7 +100,6 @@ static void *client_handler(void *arg) {
 
     server_log("Waiting for authentication on fd=%d", client_fd);
 
-    // Ожидаем AUTH или REG
     while (1) {
         int len = read_line(client_fd, line, sizeof(line));
         if (len < 0) {
@@ -168,7 +165,6 @@ static void *client_handler(void *arg) {
 
     add_online(login, client_fd, pthread_self());
 
-    // Отправляем недоставленные сообщения
     char **pending;
     int cnt = db_get_pending_messages(login, &pending);
     if (cnt > 0) {
@@ -181,7 +177,6 @@ static void *client_handler(void *arg) {
 
     server_log("User '%s' ready, entering command loop (fd=%d)", login, client_fd);
 
-    // Главный цикл команд
     while (1) {
         int len = read_line(client_fd, line, sizeof(line));
         if (len < 0) {
@@ -233,6 +228,48 @@ static void *client_handler(void *arg) {
                 snprintf(ok, sizeof(ok), "OK|msg_id=%d\n", msg_id);
                 send_line(client_fd, ok);
             }
+        } else if (strcmp(cmd, CMD_REPLY) == 0) {
+            char to[MAX_LOGIN], body[MAX_BODY];
+            int reply_to;
+            if (get_param(line, "to", to, sizeof(to)) == 0 &&
+                get_param(line, "text", body, sizeof(body)) == 0 &&
+                get_param_int(line, "reply_to", &reply_to) == 0) {
+                server_log("REPLY from '%s' to '%s' (reply_to=%d): \"%s\"", 
+                          login, to, reply_to, body);
+                int chat_id = db_get_chat_id_for_users(login, to);
+                int msg_id = db_save_message(chat_id, login, body, reply_to, 0);
+                client_entry_t *recv = find_by_login(to);
+                char fwd[MAX_MSG_LINE];
+                build_msg(fwd, sizeof(fwd), CMD_REPLY,
+                          "|from=%s|chat_id=%d|text=%s|msg_id=%d|reply_to=%d",
+                          login, chat_id, body, msg_id, reply_to);
+                if (recv) send_line(recv->fd, fwd);
+                else send_offline_msg(to, chat_id, login, body, msg_id);
+                char ok[MAX_MSG_LINE];
+                snprintf(ok, sizeof(ok), "OK|msg_id=%d\n", msg_id);
+                send_line(client_fd, ok);
+            }
+        } else if (strcmp(cmd, CMD_FWD) == 0) {
+            char to[MAX_LOGIN], body[MAX_BODY];
+            int fwd_from;
+            if (get_param(line, "to", to, sizeof(to)) == 0 &&
+                get_param(line, "text", body, sizeof(body)) == 0 &&
+                get_param_int(line, "fwd_from", &fwd_from) == 0) {
+                server_log("FWD from '%s' to '%s' (fwd_from=%d): \"%s\"", 
+                          login, to, fwd_from, body);
+                int chat_id = db_get_chat_id_for_users(login, to);
+                int msg_id = db_save_message(chat_id, login, body, 0, fwd_from);
+                client_entry_t *recv = find_by_login(to);
+                char fwd[MAX_MSG_LINE];
+                build_msg(fwd, sizeof(fwd), CMD_FWD,
+                          "|from=%s|chat_id=%d|text=%s|msg_id=%d|fwd_from=%d",
+                          login, chat_id, body, msg_id, fwd_from);
+                if (recv) send_line(recv->fd, fwd);
+                else send_offline_msg(to, chat_id, login, body, msg_id);
+                char ok[MAX_MSG_LINE];
+                snprintf(ok, sizeof(ok), "OK|msg_id=%d\n", msg_id);
+                send_line(client_fd, ok);
+            }
         } else if (strcmp(cmd, CMD_CREATE) == 0) {
             char name[MAX_LOGIN], members_str[MAX_MSG_LINE];
             if (get_param(line, "name", name, sizeof(name)) == 0 &&
@@ -248,12 +285,10 @@ static void *client_handler(void *arg) {
                 server_log("Creating group '%s' with %d members by '%s'", name, mcnt, login);
                 int chat_id = db_create_group(name, marr, mcnt);
                 if (chat_id > 0) {
-                    // Сначала отвечаем создателю
                     char ok[MAX_MSG_LINE];
                     snprintf(ok, sizeof(ok), "OK|chat_id=%d\n", chat_id);
                     send_line(client_fd, ok);
 
-                    // Рассылаем уведомления остальным участникам
                     char note[MAX_MSG_LINE];
                     build_msg(note, sizeof(note), CMD_OK,
                               "|action=group_created|chat_id=%d|name=%s",
@@ -317,7 +352,6 @@ static void *client_handler(void *arg) {
                 if (is_group) {
                     strncpy(display_name, chat_name ? chat_name : "Group", MAX_LOGIN-1);
                 } else {
-                    // Находим логин собеседника
                     sqlite3_stmt *stmt2;
                     sqlite3_prepare_v2(db, 
                         "SELECT user_login FROM chat_members WHERE chat_id=? AND user_login!=?",
