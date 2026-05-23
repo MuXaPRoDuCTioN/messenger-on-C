@@ -21,7 +21,9 @@ int local_db_init(const char *login) {
         " chat_id INTEGER NOT NULL,"
         " sender TEXT NOT NULL,"
         " body TEXT NOT NULL,"
-        " server_msg_id INTEGER);"
+        " server_msg_id INTEGER,"
+        " reply_to INTEGER DEFAULT -1,"
+        " fwd_from INTEGER DEFAULT -1);"
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_server_msg_id "
         "ON messages(server_msg_id) WHERE server_msg_id >= 0;";
     char *err = NULL;
@@ -38,16 +40,19 @@ void local_db_close(void) {
     if (local_db) sqlite3_close(local_db);
 }
 
-void local_db_save_msg(int chat_id, const char *sender, int server_msg_id, const char *body) {
+void local_db_save_msg(int chat_id, const char *sender, int server_msg_id, const char *body,
+                       int reply_to, int fwd_from) {
     if (!local_db) return;
     sqlite3_stmt *stmt;
-    const char *sql = "INSERT OR IGNORE INTO messages (chat_id, sender, body, server_msg_id)"
-                      " VALUES (?, ?, ?, ?);";
+    const char *sql = "INSERT OR IGNORE INTO messages (chat_id, sender, body, server_msg_id, reply_to, fwd_from)"
+                      " VALUES (?, ?, ?, ?, ?, ?);";
     sqlite3_prepare_v2(local_db, sql, -1, &stmt, NULL);
     sqlite3_bind_int(stmt, 1, chat_id);
     sqlite3_bind_text(stmt, 2, sender, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 3, body, -1, SQLITE_STATIC);
     sqlite3_bind_int(stmt, 4, server_msg_id);
+    sqlite3_bind_int(stmt, 5, reply_to);
+    sqlite3_bind_int(stmt, 6, fwd_from);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
 }
@@ -92,10 +97,11 @@ int local_db_get_chats(int **ids, char ***names, int **is_groups) {
     return count;
 }
 
-int local_db_get_messages(int chat_id, char ***senders, char ***bodies, int **msg_ids, int limit) {
+int local_db_get_messages(int chat_id, char ***senders, char ***bodies, int **msg_ids,
+                          int **reply_tos, int **fwd_froms, int limit) {
     if (!local_db) return 0;
     sqlite3_stmt *stmt;
-    const char *sql = "SELECT sender, body, server_msg_id FROM messages WHERE chat_id = ? "
+    const char *sql = "SELECT sender, body, server_msg_id, reply_to, fwd_from FROM messages WHERE chat_id = ? "
                       "ORDER BY msg_id ASC LIMIT ?;";
     sqlite3_prepare_v2(local_db, sql, -1, &stmt, NULL);
     sqlite3_bind_int(stmt, 1, chat_id);
@@ -104,22 +110,32 @@ int local_db_get_messages(int chat_id, char ***senders, char ***bodies, int **ms
     char **s = NULL;
     char **b = NULL;
     int *ids = NULL;
+    int *r = NULL;
+    int *f = NULL;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const char *sender = (const char*)sqlite3_column_text(stmt, 0);
         const char *body = (const char*)sqlite3_column_text(stmt, 1);
         int server_id = sqlite3_column_int(stmt, 2);
+        int reply_to = sqlite3_column_int(stmt, 3);
+        int fwd_from = sqlite3_column_int(stmt, 4);
         s = realloc(s, (count+1)*sizeof(char*));
         b = realloc(b, (count+1)*sizeof(char*));
         ids = realloc(ids, (count+1)*sizeof(int));
+        r = realloc(r, (count+1)*sizeof(int));
+        f = realloc(f, (count+1)*sizeof(int));
         s[count] = strdup(sender ? sender : "unknown");
         b[count] = strdup(body ? body : "");
         ids[count] = server_id;
+        r[count] = reply_to;
+        f[count] = fwd_from;
         count++;
     }
     sqlite3_finalize(stmt);
     *senders = s;
     *bodies = b;
     *msg_ids = ids;
+    *reply_tos = r;
+    *fwd_froms = f;
     return count;
 }
 
@@ -166,7 +182,8 @@ void local_db_free_chat_list(int count, int *ids, char **names, int *is_groups) 
     free(is_groups);
 }
 
-void local_db_free_messages(int count, char **senders, char **bodies, int *msg_ids) {
+void local_db_free_messages(int count, char **senders, char **bodies, int *msg_ids,
+                            int *reply_tos, int *fwd_froms) {
     for (int i = 0; i < count; i++) {
         free(senders[i]);
         free(bodies[i]);
@@ -174,6 +191,8 @@ void local_db_free_messages(int count, char **senders, char **bodies, int *msg_i
     free(senders);
     free(bodies);
     free(msg_ids);
+    free(reply_tos);
+    free(fwd_froms);
 }
 
 void local_db_update_chat_id(int old_id, int new_id) {
@@ -197,9 +216,8 @@ void local_db_update_chat_id(int old_id, int new_id) {
 void local_db_confirm_last_msg(int chat_id, int new_server_msg_id) {
     if (!local_db) return;
     sqlite3_stmt *stmt;
-    // Обновляем самое старое неподтверждённое сообщение
     const char *sql = "SELECT msg_id FROM messages WHERE chat_id = ? AND server_msg_id = -1 "
-                      "ORDER BY msg_id ASC LIMIT 1;";
+                      "ORDER BY msg_id DESC LIMIT 1;";
     sqlite3_prepare_v2(local_db, sql, -1, &stmt, NULL);
     sqlite3_bind_int(stmt, 1, chat_id);
     if (sqlite3_step(stmt) == SQLITE_ROW) {

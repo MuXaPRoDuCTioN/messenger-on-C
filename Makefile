@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c11 -pthread -D_POSIX_C_SOURCE=200809L
-LDFLAGS = -lncurses -lsqlite3
+LDFLAGS = -lncursesw -lsqlite3
 
 COMMON_DIR = common
 SERVER_DIR = server
