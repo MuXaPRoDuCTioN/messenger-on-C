@@ -9,7 +9,7 @@
 char my_login[MAX_LOGIN] = {0};
 
 int main(int argc, char *argv[]) {
-    setlocale(LC_ALL, "");  // поддержка русского языка
+    setlocale(LC_ALL, "");  // поддержка русского языка в интерфейсе
     if (argc < 2) {
         printf("Usage: %s <server_ip>\n", argv[0]);
         return 1;
@@ -19,6 +19,19 @@ int main(int argc, char *argv[]) {
     fflush(stdout);
     fgets(my_login, sizeof(my_login), stdin);
     my_login[strcspn(my_login, "\n")] = '\0';
+
+    // Проверка, что логин содержит только ASCII (латиница, цифры, знаки)
+    int invalid = 0;
+    for (int i = 0; my_login[i]; i++) {
+        if ((unsigned char)my_login[i] > 127) {
+            invalid = 1;
+            break;
+        }
+    }
+    if (invalid) {
+        printf("Логин должен содержать только латинские буквы и цифры.\n");
+        return 1;
+    }
 
     printf("Введите пароль: ");
     fflush(stdout);
