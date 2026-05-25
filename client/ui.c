@@ -17,7 +17,7 @@ int active_chat_idx = -1;
 static WINDOW *chat_win, *msg_win, *input_win, *help_win;
 static int msg_win_h, msg_win_w;
 static int chat_win_w;
-static int show_help = 0;
+static int help_state = 0;          // 0 = управление, 1 = команды
 
 static wchar_t input_buf[MAX_BODY];
 static int input_len = 0;
@@ -35,9 +35,13 @@ static int pending_fwd_srv_id = 0;
 static int pending_fwd_local = 0;
 static char pending_fwd_user[MAX_LOGIN] = {0};
 static char pending_fwd_original_sender[MAX_LOGIN] = {0};
+static char pending_fwd_original_body[MAX_BODY] = {0};
 static int fwd_candidate_idx = 0;
 
 enum { COLOR_MY_MSG = 1, COLOR_OTHER_MSG, COLOR_HIGHLIGHT, COLOR_GROUP, COLOR_INFO, COLOR_ID, COLOR_SELECTED };
+
+static size_t safe_utf8_cut(const char *str, size_t max_bytes);
+static size_t utf8_char_len(unsigned char c);
 
 static void load_chat_history(int chat_id);
 static void print_msg_line(const char *sender, const char *body, int local_id, int is_me, int selected,
@@ -77,7 +81,7 @@ void init_ui(void) {
     msg_win_w = w - chat_win_w;
 
     wattron(help_win, COLOR_PAIR(COLOR_INFO));
-    mvwprintw(help_win, 0, 0, "Enter: отправить | /msg /create | Ctrl+R ответ | Ctrl+F переслать");
+    mvwaddstr(help_win, 0, 0, "F1 выход | Tab чаты | ↑↓ выбор | Ctrl+R ответ | Ctrl+F переслать | /help команды");
     wattroff(help_win, COLOR_PAIR(COLOR_INFO));
 
     redraw_all();
@@ -122,12 +126,10 @@ void redraw_all(void) {
     display_input_line();
 
     wattron(help_win, COLOR_PAIR(COLOR_INFO));
-    if (show_help) {
-        mvwprintw(help_win, 0, 0, "Enter: отправить | /msg /create | Ctrl+R ответ | Ctrl+F переслать");
-    } else if (input_mode == MODE_FWD_SELECT_CHAT) {
-        mvwprintw(help_win, 0, 0, "Tab: выбрать чат | Enter: подтвердить выбор");
+    if (help_state == 1) {
+        mvwaddstr(help_win, 0, 0, "/help управление | Команды: /msg <user> создать чат | /create <name> <u1,u2> группа");
     } else {
-        mvwprintw(help_win, 0, 0, "F1: выход | Tab: чаты | ↑↓: выбрать сообщение");
+        mvwaddstr(help_win, 0, 0, "F1 выход | Tab чаты | ↑↓ выбор | Ctrl+R ответ | Ctrl+F переслать | /help команды");
     }
     wattroff(help_win, COLOR_PAIR(COLOR_INFO));
 
@@ -136,26 +138,64 @@ void redraw_all(void) {
     wrefresh(help_win);
 }
 
+static size_t utf8_char_len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if (c < 0xC0) return 0;
+    if (c < 0xE0) return 2;
+    if (c < 0xF0) return 3;
+    if (c < 0xF8) return 4;
+    return 0;
+}
+
+static size_t safe_utf8_cut(const char *str, size_t max_bytes) {
+    size_t len = strlen(str);
+    if (len <= max_bytes) return len;
+    size_t cut = max_bytes;
+    while (cut > 0 && utf8_char_len((unsigned char)str[cut]) == 0) {
+        cut--;
+    }
+    return cut;
+}
+
 static void display_input_line(void) {
     werase(input_win);
+    const char *prefix = "> ";
     if (input_mode == MODE_REPLY) {
-        mvwprintw(input_win, 0, 0, ">> ответ на #%d: ", pending_reply_local);
+        char buf[64];
+        snprintf(buf, sizeof(buf), ">> ответ на #%d: ", pending_reply_local);
+        prefix = buf;
     } else if (input_mode == MODE_FWD_SELECT_CHAT) {
-        mvwprintw(input_win, 0, 0, ">> переслать #%d -> %s (Enter для выбора): ",
-                  pending_fwd_local,
-                  chat_list[fwd_candidate_idx].name);
+        char buf[64];
+        snprintf(buf, sizeof(buf), ">> переслать #%d -> %s (Enter): ", pending_fwd_local, chat_list[fwd_candidate_idx].name);
+        prefix = buf;
     } else if (input_mode == MODE_FWD_TEXT) {
-        mvwprintw(input_win, 0, 0, ">> переслать #%d -> %s: ",
-                  pending_fwd_local, pending_fwd_user);
-    } else {
-        mvwaddstr(input_win, 0, 0, "> ");
+        char buf[64];
+        snprintf(buf, sizeof(buf), ">> переслать #%d -> %s: ", pending_fwd_local, pending_fwd_user);
+        prefix = buf;
     }
+
+    char mb_text[MAX_BODY*4] = {0};
     for (int i = 0; i < input_len; i++) {
-        wchar_t wch = input_buf[i];
-        char mb[8] = {0};
-        if (wctomb(mb, wch) > 0) {
-            waddstr(input_win, mb);
+        char tmp[8] = {0};
+        if (wctomb(tmp, input_buf[i]) > 0) {
+            strncat(mb_text, tmp, sizeof(mb_text)-strlen(mb_text)-1);
         }
+    }
+
+    int max_input_vis = COLS - (int)strlen(prefix) - 1;
+    if (max_input_vis < 10) max_input_vis = 10;
+    size_t text_len = strlen(mb_text);
+    size_t start = 0;
+    if (text_len > (size_t)max_input_vis) {
+        start = text_len - max_input_vis;
+        while (start > 0 && utf8_char_len((unsigned char)mb_text[start]) == 0) {
+            start--;
+        }
+    }
+
+    mvwaddstr(input_win, 0, 0, prefix);
+    if (text_len > 0) {
+        waddnstr(input_win, mb_text + start, text_len - start);
     }
     wrefresh(input_win);
 }
@@ -238,7 +278,7 @@ void process_command(const char *cmd_line) {
     } else if (strcmp(cmd, "list") == 0) {
         send_cmd("LIST\n");
     } else if (strcmp(cmd, "help") == 0) {
-        show_help = !show_help;
+        help_state = (help_state + 1) % 2;
         redraw_all();
     } else if (strcmp(cmd, "quit") == 0) {
         connected = 0;
@@ -280,23 +320,6 @@ static int find_sender_by_server_id(int server_id, char *sender, size_t size) {
     return 0;
 }
 
-static void extract_fwd_sender(const char *body, char *sender, size_t size) {
-    if (!body || !sender || size == 0) return;
-    const char *p = body;
-    if (strncmp(p, "[from ", 6) == 0) {
-        p += 6;
-        const char *end = strchr(p, ']');
-        if (end) {
-            size_t len = end - p;
-            if (len >= size) len = size - 1;
-            memcpy(sender, p, len);
-            sender[len] = '\0';
-            return;
-        }
-    }
-    snprintf(sender, size, "unknown");
-}
-
 static void print_msg_line(const char *sender, const char *body, int local_id, int is_me, int selected,
                            int reply_to_local, int fwd_from_server,
                            const char *reply_sender, const char *fwd_sender) {
@@ -309,32 +332,17 @@ static void print_msg_line(const char *sender, const char *body, int local_id, i
     }
     *dst = '\0';
 
-    // Если сообщение является пересланным и отправитель известен, убираем [from ...] из тела
     if (fwd_from_server >= 0 && fwd_sender && fwd_sender[0]) {
         char *from_pos = strstr(clean_body, "[from ");
         if (from_pos) {
             char *end_pos = strchr(from_pos, ']');
             if (end_pos) {
-                // убираем "[from ...] " (включая следующий пробел, если есть)
-                int len = end_pos - from_pos + 1; // длина "[from ...]"
-                if (*(end_pos+1) == ' ') len++; // учитываем пробел
+                int len = end_pos - from_pos + 1;
+                if (*(end_pos+1) == ' ') len++;
                 memmove(from_pos, from_pos + len, strlen(from_pos + len) + 1);
             }
         }
     }
-
-    if (cur_msg_y >= msg_win_h - 1) {
-        scroll(msg_win);
-        cur_msg_y = msg_win_h - 2;
-    }
-    if (selected) {
-        wattron(msg_win, COLOR_PAIR(COLOR_SELECTED));
-    } else {
-        wattron(msg_win, COLOR_PAIR(COLOR_ID));
-    }
-    mvwprintw(msg_win, ++cur_msg_y, 1, "[%d]", local_id);
-    if (selected) wattroff(msg_win, COLOR_PAIR(COLOR_SELECTED));
-    else wattroff(msg_win, COLOR_PAIR(COLOR_ID));
 
     char prefix[64] = "";
     if (reply_to_local > 0 && reply_sender) {
@@ -345,34 +353,60 @@ static void print_msg_line(const char *sender, const char *body, int local_id, i
         if (fwd_sender && fwd_sender[0]) {
             snprintf(prefix, sizeof(prefix), "(от %s) ", fwd_sender);
         } else {
-            // fallback: попытка извлечь из тела, если отправитель не найден
-            char fwd_sender_buf[MAX_LOGIN];
-            extract_fwd_sender(clean_body, fwd_sender_buf, sizeof(fwd_sender_buf));
-            if (fwd_sender_buf[0] && strcmp(fwd_sender_buf, "unknown") != 0) {
-                snprintf(prefix, sizeof(prefix), "(от %s) ", fwd_sender_buf);
-                // Удалим [from ...] из тела, чтобы не дублировать
-                char *from_pos2 = strstr(clean_body, "[from ");
-                if (from_pos2) {
-                    char *end_pos2 = strchr(from_pos2, ']');
-                    if (end_pos2) {
-                        int len = end_pos2 - from_pos2 + 1;
-                        if (*(end_pos2+1) == ' ') len++;
-                        memmove(from_pos2, from_pos2 + len, strlen(from_pos2 + len) + 1);
-                    }
-                }
-            } else {
-                snprintf(prefix, sizeof(prefix), "(переслано) ");
-            }
+            snprintf(prefix, sizeof(prefix), "(переслано) ");
         }
     }
 
-    if (is_me) wattron(msg_win, COLOR_PAIR(COLOR_MY_MSG));
-    else wattron(msg_win, COLOR_PAIR(COLOR_OTHER_MSG));
-    if (selected) wattron(msg_win, A_REVERSE);
-    mvwprintw(msg_win, cur_msg_y, 6, "[%s]: %s%s", sender, prefix, clean_body);
-    if (is_me) wattroff(msg_win, COLOR_PAIR(COLOR_MY_MSG));
-    else wattroff(msg_win, COLOR_PAIR(COLOR_OTHER_MSG));
-    if (selected) wattroff(msg_win, A_REVERSE);
+    char full_line[MAX_BODY + 128];
+    snprintf(full_line, sizeof(full_line), "[%s]: %s%s", sender, prefix, clean_body);
+
+    // Динамический отступ под номер сообщения
+    char id_str[20];
+    snprintf(id_str, sizeof(id_str), "[%d]", local_id);
+    int id_len = strlen(id_str);
+    int left_margin = 1;          // отступ от левого края окна
+    int text_start = left_margin + id_len + 1; // +1 пробел после ID
+    int text_max_width = msg_win_w - 2 - text_start;   // до правой рамки
+    if (text_max_width < 10) text_max_width = 10;
+
+    const char *ptr = full_line;
+    int line_printed = 0;
+
+    while (*ptr && cur_msg_y < msg_win_h - 1) {
+        if (cur_msg_y >= msg_win_h - 1) {
+            scroll(msg_win);
+            cur_msg_y = msg_win_h - 2;
+        }
+
+        if (line_printed == 0) {
+            if (selected) wattron(msg_win, COLOR_PAIR(COLOR_SELECTED));
+            else wattron(msg_win, COLOR_PAIR(COLOR_ID));
+            mvwaddstr(msg_win, ++cur_msg_y, left_margin, id_str);
+            if (selected) wattroff(msg_win, COLOR_PAIR(COLOR_SELECTED));
+            else wattroff(msg_win, COLOR_PAIR(COLOR_ID));
+        }
+
+        size_t safe_len = safe_utf8_cut(ptr, text_max_width);
+        if (safe_len == 0) break;
+
+        if (is_me) wattron(msg_win, COLOR_PAIR(COLOR_MY_MSG));
+        else wattron(msg_win, COLOR_PAIR(COLOR_OTHER_MSG));
+        if (selected) wattron(msg_win, A_REVERSE);
+
+        if (line_printed == 0) {
+            mvwaddnstr(msg_win, cur_msg_y, text_start, ptr, safe_len);
+        } else {
+            // отступ для продолжения равен text_start, но без номера; номер не печатаем
+            mvwaddnstr(msg_win, ++cur_msg_y, text_start, ptr, safe_len);
+        }
+
+        if (is_me) wattroff(msg_win, COLOR_PAIR(COLOR_MY_MSG));
+        else wattroff(msg_win, COLOR_PAIR(COLOR_OTHER_MSG));
+        if (selected) wattroff(msg_win, A_REVERSE);
+
+        ptr += safe_len;
+        line_printed++;
+    }
 }
 
 static void load_chat_history(int chat_id) {
@@ -667,8 +701,8 @@ void process_input(void) {
                             input_mode = MODE_NORMAL;
                             pending_reply_srv_id = pending_reply_local = 0;
                         } else if (input_mode == MODE_FWD_TEXT) {
-                            char clean_text[MAX_BODY];
-                            sanitize_body(clean_text, mb_text, sizeof(clean_text));
+                            char comment_text[MAX_BODY];
+                            sanitize_body(comment_text, mb_text, sizeof(comment_text));
                             int dest_idx = -1;
                             for (int i = 0; i < chat_count; i++) {
                                 if (strcmp(chat_list[i].name, pending_fwd_user) == 0) {
@@ -677,8 +711,13 @@ void process_input(void) {
                             }
                             if (dest_idx >= 0) {
                                 char final_text[MAX_BODY * 2];
-                                snprintf(final_text, sizeof(final_text), "[from %s] %s",
-                                         pending_fwd_original_sender, clean_text);
+                                if (strlen(comment_text) > 0) {
+                                    snprintf(final_text, sizeof(final_text), "[from %s] \"%s\" | %s",
+                                             pending_fwd_original_sender, pending_fwd_original_body, comment_text);
+                                } else {
+                                    snprintf(final_text, sizeof(final_text), "[from %s] \"%s\"",
+                                             pending_fwd_original_sender, pending_fwd_original_body);
+                                }
                                 if (chat_list[dest_idx].is_group) {
                                     char sendline[MAX_MSG_LINE];
                                     build_msg(sendline, sizeof(sendline), CMD_GRP,
@@ -703,6 +742,7 @@ void process_input(void) {
                             pending_fwd_srv_id = pending_fwd_local = 0;
                             pending_fwd_user[0] = '\0';
                             pending_fwd_original_sender[0] = '\0';
+                            pending_fwd_original_body[0] = '\0';
                         } else if (mb_text[0] == '/') {
                             process_command(mb_text);
                         } else if (active_chat_idx >= 0) {
@@ -745,6 +785,9 @@ void process_input(void) {
                         char orig_sender[MAX_LOGIN] = "unknown";
                         local_db_get_msg_sender(chat->chat_id, srv_id, orig_sender, sizeof(orig_sender));
                         strncpy(pending_fwd_original_sender, orig_sender, MAX_LOGIN-1);
+                        char orig_body[MAX_BODY] = "";
+                        local_db_get_body_by_msg_id(chat->chat_id, srv_id, orig_body, sizeof(orig_body));
+                        sanitize_body(pending_fwd_original_body, orig_body, sizeof(pending_fwd_original_body));
                         input_mode = MODE_FWD_SELECT_CHAT;
                         fwd_candidate_idx = (active_chat_idx + 1) % chat_count;
                         input_len = 0;
