@@ -1,10 +1,37 @@
+/*
+ * client/local_db.c – локальная база данных клиента (SQLite).
+ *
+ * Хранит кэш чатов и сообщений в файле client_cache_<login>.db.
+ * Это позволяет:
+ *   - быстро отображать историю при входе (без запросов к серверу);
+ *   - работать с перепиской даже при временном отсутствии сети;
+ *   - корректно обрабатывать дубликаты сообщений от сервера.
+ *
+ * Таблицы:
+ *   chats    – список чатов (id, имя, флаг is_group)
+ *   messages – сообщения (id, chat_id, отправитель, текст, server_msg_id,
+ *              reply_to, fwd_from)
+ *
+ * Важно: на поле server_msg_id (если >=0) установлен уникальный индекс,
+ * чтобы при повторном получении истории с сервера не возникало дубликатов.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sqlite3.h>
 
-static sqlite3 *local_db = NULL;
+static sqlite3 *local_db = NULL;   /* глобальный хэндл локальной БД */
 
+/*
+ * local_db_init – открывает (или создаёт) локальную базу для пользователя.
+ *
+ * Параметр login используется для формирования имени файла:
+ * client_cache_<login>.db
+ *
+ * Создаёт таблицы chats и messages, если они ещё не существуют.
+ * Возвращает 0 при успехе, -1 при ошибке.
+ */
 int local_db_init(const char *login) {
     char filename[64];
     snprintf(filename, sizeof(filename), "client_cache_%s.db", login);
@@ -13,19 +40,20 @@ int local_db_init(const char *login) {
 
     const char *sql =
         "CREATE TABLE IF NOT EXISTS chats ("
-        " chat_id INTEGER PRIMARY KEY,"
-        " name TEXT,"
-        " is_group INTEGER DEFAULT 0);"
+        " chat_id INTEGER PRIMARY KEY,"          /* ID чата (может быть -1 до подтверждения сервером) */
+        " name TEXT,"                             /* имя собеседника или название группы */
+        " is_group INTEGER DEFAULT 0);"           /* 0 – личный, 1 – группа */
         "CREATE TABLE IF NOT EXISTS messages ("
-        " msg_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " msg_id INTEGER PRIMARY KEY AUTOINCREMENT,"  /* локальный автоинкрементный ключ */
         " chat_id INTEGER NOT NULL,"
         " sender TEXT NOT NULL,"
         " body TEXT NOT NULL,"
-        " server_msg_id INTEGER,"
-        " reply_to INTEGER DEFAULT -1,"
-        " fwd_from INTEGER DEFAULT -1);"
+        " server_msg_id INTEGER,"                     /* ID сообщения на сервере (-1 для своих неподтверждённых) */
+        " reply_to INTEGER DEFAULT -1,"               /* ID сообщения, на которое отвечаем */
+        " fwd_from INTEGER DEFAULT -1);"              /* ID чата-источника при пересылке */
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_server_msg_id "
-        "ON messages(server_msg_id) WHERE server_msg_id >= 0;";
+        "ON messages(server_msg_id) WHERE server_msg_id >= 0;";   /* не даём дублировать подтверждённые сообщения */
+
     char *err = NULL;
     rc = sqlite3_exec(local_db, sql, NULL, NULL, &err);
     if (rc != SQLITE_OK) {
@@ -36,10 +64,27 @@ int local_db_init(const char *login) {
     return 0;
 }
 
+/*
+ * local_db_close – закрывает локальную базу данных.
+ */
 void local_db_close(void) {
     if (local_db) sqlite3_close(local_db);
 }
 
+/*
+ * local_db_save_msg – сохраняет сообщение в локальную БД.
+ *
+ * Параметры:
+ *   chat_id       – ID чата
+ *   sender        – отправитель
+ *   server_msg_id – ID сообщения на сервере (или -1, если ещё не подтверждено)
+ *   body          – текст сообщения
+ *   reply_to      – ID сообщения, на которое отвечают (-1 если не ответ)
+ *   fwd_from      – ID чата, из которого переслано (-1 если не пересылка)
+ *
+ * Использует INSERT OR IGNORE – если сообщение с таким server_msg_id уже есть,
+ * повторно не вставляется (защита от дублирования).
+ */
 void local_db_save_msg(int chat_id, const char *sender, int server_msg_id, const char *body,
                        int reply_to, int fwd_from) {
     if (!local_db) return;
@@ -57,6 +102,11 @@ void local_db_save_msg(int chat_id, const char *sender, int server_msg_id, const
     sqlite3_finalize(stmt);
 }
 
+/*
+ * local_db_add_chat – добавляет (или обновляет) информацию о чате в локальной БД.
+ *
+ * Если чат с таким chat_id уже существует, он будет обновлён (INSERT OR REPLACE).
+ */
 void local_db_add_chat(int id, const char *name, int is_group) {
     if (!local_db) return;
     sqlite3_stmt *stmt;
@@ -69,6 +119,13 @@ void local_db_add_chat(int id, const char *name, int is_group) {
     sqlite3_finalize(stmt);
 }
 
+/*
+ * local_db_get_chats – загружает список всех чатов из локальной БД.
+ *
+ * Возвращает количество чатов, а через параметры – три динамических массива:
+ *   ids, names, is_groups
+ * Освобождать память нужно вызовом local_db_free_chat_list.
+ */
 int local_db_get_chats(int **ids, char ***names, int **is_groups) {
     if (!local_db) return 0;
     sqlite3_stmt *stmt;
@@ -97,6 +154,17 @@ int local_db_get_chats(int **ids, char ***names, int **is_groups) {
     return count;
 }
 
+/*
+ * local_db_get_messages – загружает сообщения конкретного чата из локальной БД.
+ *
+ * Параметры:
+ *   chat_id – ID чата
+ *   limit   – максимальное количество сообщений
+ *   senders, bodies, msg_ids, reply_tos, fwd_froms – выходные массивы
+ *
+ * Возвращает количество сообщений.
+ * Освобождать память нужно вызовом local_db_free_messages.
+ */
 int local_db_get_messages(int chat_id, char ***senders, char ***bodies, int **msg_ids,
                           int **reply_tos, int **fwd_froms, int limit) {
     if (!local_db) return 0;
@@ -139,6 +207,11 @@ int local_db_get_messages(int chat_id, char ***senders, char ***bodies, int **ms
     return count;
 }
 
+/*
+ * local_db_get_body_by_msg_id – получает текст сообщения по server_msg_id.
+ *
+ * Возвращает 0 при успехе, -1 если сообщение не найдено.
+ */
 int local_db_get_body_by_msg_id(int chat_id, int server_msg_id, char *body, size_t size) {
     if (!local_db) return -1;
     sqlite3_stmt *stmt;
@@ -157,6 +230,11 @@ int local_db_get_body_by_msg_id(int chat_id, int server_msg_id, char *body, size
     return -1;
 }
 
+/*
+ * local_db_get_msg_sender – получает отправителя сообщения по server_msg_id.
+ *
+ * Возвращает 0 при успехе, -1 если сообщение не найдено.
+ */
 int local_db_get_msg_sender(int chat_id, int server_msg_id, char *sender, size_t size) {
     if (!local_db) return -1;
     sqlite3_stmt *stmt;
@@ -175,6 +253,9 @@ int local_db_get_msg_sender(int chat_id, int server_msg_id, char *sender, size_t
     return -1;
 }
 
+/*
+ * local_db_free_chat_list – освобождает память, выделенную в local_db_get_chats.
+ */
 void local_db_free_chat_list(int count, int *ids, char **names, int *is_groups) {
     free(ids);
     for (int i = 0; i < count; i++) free(names[i]);
@@ -182,6 +263,9 @@ void local_db_free_chat_list(int count, int *ids, char **names, int *is_groups) 
     free(is_groups);
 }
 
+/*
+ * local_db_free_messages – освобождает память, выделенную в local_db_get_messages.
+ */
 void local_db_free_messages(int count, char **senders, char **bodies, int *msg_ids,
                             int *reply_tos, int *fwd_froms) {
     for (int i = 0; i < count; i++) {
@@ -195,6 +279,12 @@ void local_db_free_messages(int count, char **senders, char **bodies, int *msg_i
     free(fwd_froms);
 }
 
+/*
+ * local_db_update_chat_id – заменяет старый chat_id на новый во всех связанных записях.
+ *
+ * Используется, когда сервер вернул реальный chat_id, а клиент до этого использовал
+ * временный (например, -1).
+ */
 void local_db_update_chat_id(int old_id, int new_id) {
     if (!local_db || old_id == new_id) return;
     sqlite3_stmt *stmt;
@@ -213,6 +303,13 @@ void local_db_update_chat_id(int old_id, int new_id) {
     sqlite3_finalize(stmt);
 }
 
+/*
+ * local_db_confirm_last_msg – находит последнее своё сообщение (server_msg_id = -1)
+ * в указанном чате и присваивает ему реальный server_msg_id, полученный от сервера.
+ *
+ * Это позволяет синхронизировать локальный кэш с сервером и избежать повторной вставки
+ * того же сообщения при следующей загрузке истории.
+ */
 void local_db_confirm_last_msg(int chat_id, int new_server_msg_id) {
     if (!local_db) return;
     sqlite3_stmt *stmt;

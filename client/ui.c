@@ -1,3 +1,21 @@
+/*
+ * client/ui.c – пользовательский интерфейс клиента (ncurses).
+ *
+ * Здесь реализованы:
+ *   - инициализация и завершение ncurses;
+ *   - отрисовка левой панели (список чатов), окна сообщений, строки ввода и подсказки;
+ *   - обработка клавиш (Tab, стрелки, PgUp/PgDn, Ctrl+R, Ctrl+F, Enter, Backspace);
+ *   - отправка обычных сообщений, ответов (reply) и пересылок (forward);
+ *   - выполнение команд, введённых пользователем (/msg, /create, /list, /help, /quit);
+ *   - кэширование сообщений в памяти и подгрузка из локальной БД;
+ *   - ручной скроллинг истории с автопрокруткой при выделении сообщения;
+ *   - корректная работа с UTF-8 (кириллица) и динамическая ширина номеров сообщений.
+ *
+ * Все сообщения от сервера приходят через очередь in_queue, которая пополняется
+ * в отдельном сетевом потоке (client/network.c). Главный поток с помощью select()
+ * одновременно ожидает ввод с клавиатуры и проверяет наличие новых данных в очереди.
+ */
+
 #define _GNU_SOURCE
 #include "client.h"
 #include "local_db.h"
@@ -11,41 +29,48 @@
 #include <sys/select.h>
 #include <wchar.h>
 
+/* ---------- глобальные переменные UI ---------- */
 chat_entry_t chat_list[MAX_CHATS];
 int chat_count = 0;
-int active_chat_idx = -1;
+int active_chat_idx = -1;          /* индекс выбранного чата в chat_list */
 
+/* ncurses-окна */
 static WINDOW *chat_win, *msg_win, *input_win, *help_win;
-static int msg_win_h, msg_win_w;
-static int chat_win_w;
-static int max_name_width;
-static int help_state = 0;          /* 0 = управление, 1 = команды */
+static int msg_win_h, msg_win_w;   /* размеры окна сообщений */
+static int chat_win_w;             /* ширина левой панели */
+static int max_name_width;         /* максимальная ширина имени чата в панели */
+static int help_state = 0;         /* 0 = горячие клавиши, 1 = список команд */
 
+/* буфер строки ввода (широкие символы для поддержки кириллицы) */
 static wchar_t input_buf[MAX_BODY];
 static int input_len = 0;
 
 /*
- * msg_scroll_offset — смещение (в строках) от ПОСЛЕДНЕЙ строки истории.
+ * msg_scroll_offset – смещение (в строках) от ПОСЛЕДНЕЙ строки истории.
  * 0 = показываем самый конец (последние сообщения внизу).
  * Увеличивается при прокрутке вверх, уменьшается при прокрутке вниз.
  */
 static int msg_scroll_offset = 0;
 
-#define MODE_NORMAL          0
-#define MODE_REPLY           1
-#define MODE_FWD_SELECT_CHAT 2
-#define MODE_FWD_TEXT        3
+/* режимы работы строки ввода */
+#define MODE_NORMAL          0   /* обычный ввод */
+#define MODE_REPLY           1   /* ответ на сообщение */
+#define MODE_FWD_SELECT_CHAT 2   /* выбор чата для пересылки */
+#define MODE_FWD_TEXT        3   /* ввод текста пересылаемого сообщения */
 
 static int input_mode = MODE_NORMAL;
+
+/* данные для pending-операций (reply/forward) */
 static int pending_reply_srv_id = 0;
 static int pending_reply_local = 0;
 static int pending_fwd_srv_id = 0;
 static int pending_fwd_local = 0;
 static char pending_fwd_user[MAX_LOGIN] = {0};
-static char pending_fwd_original_sender[MAX_LOGIN] = {0};
-static char pending_fwd_original_body[MAX_BODY] = {0};
-static int fwd_candidate_idx = 0;
+static char pending_fwd_original_sender[MAX_LOGIN] = {0};   /* отправитель исходного сообщения */
+static char pending_fwd_original_body[MAX_BODY] = {0};      /* тело исходного сообщения */
+static int fwd_candidate_idx = 0;   /* индекс чата-кандидата в режиме выбора */
 
+/* цветовые пары */
 enum { COLOR_MY_MSG = 1, COLOR_OTHER_MSG, COLOR_HIGHLIGHT, COLOR_GROUP,
        COLOR_INFO, COLOR_ID, COLOR_SELECTED };
 
@@ -68,12 +93,21 @@ void process_command(const char *cmd_line);
 
 /* ========== INIT / CLEANUP ========== */
 
+/*
+ * init_ui – инициализация ncurses и создание всех окон.
+ *
+ * Вызывается один раз при старте клиента.
+ * Настраивает цвета, создаёт четыре окна (чаты, сообщения, ввод, подсказка),
+ * включает неблокирующий ввод (nodelay) и ручное управление скроллингом.
+ */
 void init_ui(void) {
-    initscr();
-    cbreak();
-    noecho();
-    curs_set(1);
-    start_color();
+    initscr();                  /* запуск ncurses */
+    cbreak();                   /* немедленная передача клавиш (без ожидания Enter) */
+    noecho();                   /* не показывать вводимые символы */
+    curs_set(1);                /* курсор видим (для строки ввода) */
+    start_color();              /* включаем поддержку цветов */
+
+    /* назначение цветовых пар */
     init_pair(COLOR_MY_MSG,    COLOR_GREEN,   COLOR_BLACK);
     init_pair(COLOR_OTHER_MSG, COLOR_WHITE,   COLOR_BLACK);
     init_pair(COLOR_HIGHLIGHT, COLOR_CYAN,    COLOR_BLACK);
@@ -82,29 +116,33 @@ void init_ui(void) {
     init_pair(COLOR_ID,        COLOR_BLACK,   COLOR_WHITE);
     init_pair(COLOR_SELECTED,  COLOR_BLACK,   COLOR_CYAN);
 
-    int h = LINES - 2, w = COLS;
+    /* расчёт размеров окон */
+    int h = LINES - 2, w = COLS;          /* две нижние строки – ввод и подсказка */
     chat_win_w = w / 4;
-    if (chat_win_w < 12) chat_win_w = 12;
+    if (chat_win_w < 12) chat_win_w = 12; /* минимальная ширина левой панели */
     chat_win  = newwin(h, chat_win_w,     0, 0);
     msg_win   = newwin(h, w - chat_win_w, 0, chat_win_w);
     input_win = newwin(1, w, LINES - 2,   0);
     help_win  = newwin(1, w, LINES - 1,   0);
-    keypad(input_win, TRUE);
-    nodelay(input_win, TRUE);
+    keypad(input_win, TRUE);              /* включение стрелок, PgUp и т.д. */
+    nodelay(input_win, TRUE);             /* неблокирующий wgetch */
     /* scrollok выключен — мы управляем скроллингом вручную */
     msg_win_h = h;
     msg_win_w = w - chat_win_w;
-    max_name_width = chat_win_w - 2;
+    max_name_width = chat_win_w - 2;      /* внутри рамки левой панели */
 
-    /* строка-подсказка */
+    /* строка-подсказка по умолчанию */
     wattron(help_win, COLOR_PAIR(COLOR_INFO));
     mvwaddstr(help_win, 0, 0,
               "F1 выход | Tab чаты | ↑↓ выбор | PgUp/PgDn прокрутка | Ctrl+R ответ | Ctrl+F переслать");
     wattroff(help_win, COLOR_PAIR(COLOR_INFO));
 
-    redraw_all();
+    redraw_all();               /* первая полная отрисовка */
 }
 
+/*
+ * cleanup_ui – освобождение ресурсов ncurses.
+ */
 void cleanup_ui(void) {
     delwin(chat_win);
     delwin(msg_win);
@@ -115,6 +153,7 @@ void cleanup_ui(void) {
 
 /* ========== UTF-8 / WIDTH HELPERS ========== */
 
+/* длина UTF-8 символа по первому байту */
 static size_t utf8_char_len(unsigned char c) {
     if (c < 0x80) return 1;
     if (c < 0xC0) return 0;       /* continuation byte */
@@ -124,6 +163,7 @@ static size_t utf8_char_len(unsigned char c) {
     return 0;
 }
 
+/* экранная ширина многобайтовой строки (в колонках) */
 static int mb_str_width(const char *s) {
     int width = 0;
     wchar_t wc;
@@ -139,8 +179,8 @@ static int mb_str_width(const char *s) {
 }
 
 /*
- * bytes_for_cols — возвращает количество БАЙТ из строки str,
- * которые помещаются в max_cols экранных колонок (без обрывания символа).
+ * bytes_for_cols – сколько БАЙТ строки помещается в max_cols экранных колонок,
+ * не обрывая многобайтовый символ.
  */
 static size_t bytes_for_cols(const char *str, int max_cols) {
     const char *p = str;
@@ -158,7 +198,10 @@ static size_t bytes_for_cols(const char *str, int max_cols) {
     return (size_t)(p - str);
 }
 
-/* обрезает имя чата для левой панели */
+/*
+ * truncate_name_for_panel – обрезает имя чата так, чтобы оно вместе с суффиксом
+ * (например, "(5)" для группы) влезало в max_width колонок левой панели.
+ */
 static void truncate_name_for_panel(char *out, size_t out_size,
                                     const char *name, const char *suffix,
                                     int max_width) {
@@ -176,6 +219,10 @@ static void truncate_name_for_panel(char *out, size_t out_size,
 
 /* ========== REDRAW ========== */
 
+/*
+ * redraw_all – перерисовка левой панели, строки ввода и подсказки.
+ * Окно сообщений здесь не трогается – его обновляет draw_msg_win.
+ */
 void redraw_all(void) {
     werase(chat_win);
     box(chat_win, 0, 0);
@@ -198,6 +245,7 @@ void redraw_all(void) {
                                     chat_list[i].name, "", max_name_width);
         }
 
+        /* подсветка: выбранный чат, группа, или чат-кандидат при forward */
         if (input_mode == MODE_FWD_SELECT_CHAT && i == fwd_candidate_idx)
             wattron(chat_win, COLOR_PAIR(COLOR_SELECTED));
         else if (i == active_chat_idx)
@@ -217,6 +265,7 @@ void redraw_all(void) {
 
     display_input_line();
 
+    /* подсказка внизу экрана */
     wattron(help_win, COLOR_PAIR(COLOR_INFO));
     if (help_state == 1) {
         mvwaddstr(help_win, 0, 0,
@@ -234,6 +283,11 @@ void redraw_all(void) {
 
 /* ========== INPUT LINE ========== */
 
+/*
+ * display_input_line – обновление строки ввода с учётом режима (обычный, reply, forward).
+ *
+ * Если текст не влезает в экран, показывает его конец (прокрутка влево).
+ */
 static void display_input_line(void) {
     werase(input_win);
     char prefix_buf[80];
@@ -252,6 +306,7 @@ static void display_input_line(void) {
         prefix = prefix_buf;
     }
 
+    /* преобразуем широкий буфер в многобайтовую строку */
     char mb_text[MAX_BODY * 4] = {0};
     for (int i = 0; i < input_len; i++) {
         char tmp[8] = {0};
@@ -263,7 +318,7 @@ static void display_input_line(void) {
     int max_text_cols = COLS - prefix_w - 1;
     if (max_text_cols < 10) max_text_cols = 10;
 
-    /* показываем последние символы, если строка длиннее экрана */
+    /* если текст длиннее экрана, показываем последние max_text_cols колонок */
     size_t text_bytes = strlen(mb_text);
     const char *show_from = mb_text;
     int text_cols = mb_str_width(mb_text);
@@ -290,6 +345,12 @@ static void display_input_line(void) {
 
 /* ========== CHAT LIST ========== */
 
+/*
+ * add_chat – добавляет чат в глобальный список chat_list и в локальную БД.
+ *
+ * Если чат с таким именем и типом уже существует, просто обновляет его chat_id
+ * (например, когда сервер вернул реальный id вместо -1).
+ */
 void add_chat(int id, const char *name, int is_group) {
     for (int i = 0; i < chat_count; i++) {
         if (strcmp(chat_list[i].name, name) == 0 && chat_list[i].is_group == is_group) {
@@ -318,6 +379,10 @@ void add_chat(int id, const char *name, int is_group) {
 
 /* ========== BODY HELPERS ========== */
 
+/*
+ * sanitize_body – копирует текст сообщения, заменяя '|' на ';' и '\n' на пробел.
+ * Это нужно, чтобы символ '|' не ломал парсинг протокола.
+ */
 static void sanitize_body(char *dest, const char *src, size_t dest_size) {
     const char *p = src;
     char *q = dest;
@@ -331,6 +396,16 @@ static void sanitize_body(char *dest, const char *src, size_t dest_size) {
 
 /* ========== COMMANDS ========== */
 
+/*
+ * process_command – обработка команд, начинающихся с '/'.
+ *
+ * Поддерживаемые команды:
+ *   /msg <user>         – создать личный чат или переключиться на существующий
+ *   /create <name> <u1,u2,...> – создать групповой чат
+ *   /list               – запросить список онлайн-пользователей
+ *   /help               – переключить подсказку (горячие клавиши / команды)
+ *   /quit               – выйти
+ */
 void process_command(const char *cmd_line) {
     if (cmd_line[0] != '/') return;
     char cmd_copy[MAX_MSG_LINE];
@@ -344,6 +419,7 @@ void process_command(const char *cmd_line) {
     if (strcmp(cmd, "msg") == 0) {
         char *user = strtok_r(NULL, " ", &saveptr);
         if (!user) return;
+        /* проверка, что имя пользователя не слишком длинное для левой панели */
         if (mb_str_width(user) > max_name_width) {
             werase(input_win);
             mvwaddstr(input_win, 0, 0, "Слишком длинное имя пользователя");
@@ -360,7 +436,7 @@ void process_command(const char *cmd_line) {
         else {
             add_chat(-1, user, 0);
             active_chat_idx = chat_count - 1;
-            send_cmd("GET_CHATS\n");
+            send_cmd("GET_CHATS\n");   /* запрос реального chat_id с сервера */
         }
         input_mode = MODE_NORMAL;
         input_len = 0;
@@ -372,6 +448,7 @@ void process_command(const char *cmd_line) {
         char *name    = strtok_r(NULL, " ",  &saveptr);
         char *members = strtok_r(NULL, "",   &saveptr);
         if (name && members) {
+            /* проверка ширины названия группы (с учётом суффикса "(99)") */
             if (mb_str_width(name) > max_name_width - 4) {
                 werase(input_win);
                 mvwaddstr(input_win, 0, 0, "Слишком длинное название группы");
@@ -386,7 +463,7 @@ void process_command(const char *cmd_line) {
     } else if (strcmp(cmd, "list") == 0) {
         send_cmd("LIST\n");
     } else if (strcmp(cmd, "help") == 0) {
-        help_state = (help_state + 1) % 2;
+        help_state = (help_state + 1) % 2;   /* переключение подсказки */
         redraw_all();
     } else if (strcmp(cmd, "quit") == 0) {
         connected = 0;
@@ -396,9 +473,11 @@ void process_command(const char *cmd_line) {
 /* ========== MESSAGE SELECTION (стрелки) ========== */
 
 /*
- * move_selection(delta) — изменяет selected_msg_idx на +delta,
- * и подкручивает msg_scroll_offset так, чтобы выделенное сообщение
- * было видно (в идеале – в верхней трети окна).
+ * move_selection – перемещает выделение на delta сообщений вверх/вниз.
+ *
+ * После изменения индекса вызывает load_chat_history, которая через
+ * draw_msg_win автоматически подкрутит скролл, чтобы выделенное сообщение
+ * было видно.
  */
 static void move_selection(int delta) {
     if (active_chat_idx < 0) return;
@@ -409,12 +488,11 @@ static void move_selection(int delta) {
     if (new_sel < 0)               new_sel = chat->msg_count - 1;
     if (new_sel >= chat->msg_count) new_sel = 0;
 
-    /* Сначала просто обновляем индекс и перерисовываем.
-       Корректировка скролла делается внутри draw_msg_win (keep_visible). */
     chat->selected_msg_idx = new_sel;
     load_chat_history(chat->chat_id);
 }
 
+/* server_id_to_local – преобразует server_msg_id в локальный номер (1-based) */
 static int server_id_to_local(const chat_entry_t *chat, int server_id) {
     if (!chat->server_msg_ids || server_id < 0) return -1;
     for (int i = 0; i < chat->msg_count; i++)
@@ -427,18 +505,24 @@ static int server_id_to_local(const chat_entry_t *chat, int server_id) {
 /*
  * rendered_line_t – одна строка сообщения.
  *
- * is_id_line   – содержит номер сообщения (только первая строка).
- * is_me / selected / id_str  – для цветов.
- * text         – сам текст (без номера).
+ * Если is_id_line == 1, то в id_str лежит "[N]".
+ * text – текст строки (для первой строки – после номера).
  */
 typedef struct {
     char   text[MAX_MSG_LINE];
-    int    is_id_line;
-    int    is_me;
-    int    selected;
+    int    is_id_line;      /* содержит ли эта строка номер сообщения */
+    int    is_me;           /* сообщение от текущего пользователя? */
+    int    selected;        /* выделено ли сообщение (для цветов) */
     char   id_str[20];      /* "[N]" – только для первой строки */
 } rendered_line_t;
 
+/*
+ * render_msg – рендерит одно сообщение в массив rendered_line_t.
+ *
+ * Разбивает текст на строки шириной text_max_cols колонок.
+ * Возвращает динамический массив строк, *out_count – их количество.
+ * Вызывающая сторона должна освободить память (free(lines)).
+ */
 static rendered_line_t *render_msg(
         const char *sender, const char *body, int local_id,
         int is_me, int selected,
@@ -446,7 +530,7 @@ static rendered_line_t *render_msg(
         const char *reply_sender,
         int text_max_cols, int *out_count)
 {
-    /* ---- подготовка тела ---- */
+    /* ---- подготовка тела (без \n) ---- */
     char clean_body[MAX_BODY];
     const char *src = body;
     char *dst = clean_body;
@@ -486,7 +570,7 @@ static rendered_line_t *render_msg(
             snprintf(prefix, sizeof(prefix), "(переслано) ");
     }
 
-    /* ---- полная строка ---- */
+    /* ---- полная строка для вывода ---- */
     char full_line[MAX_BODY + 256];
     snprintf(full_line, sizeof(full_line), "[%s]: %s%s", sender, prefix, clean_body);
 
@@ -494,7 +578,7 @@ static rendered_line_t *render_msg(
     char id_str[20];
     snprintf(id_str, sizeof(id_str), "[%d]", local_id);
 
-    /* ---- разбиваем full_line на куски ---- */
+    /* ---- разбиваем full_line на куски шириной text_max_cols ---- */
     int capacity = 4;
     rendered_line_t *lines = malloc(capacity * sizeof(rendered_line_t));
     int count = 0;
@@ -538,9 +622,11 @@ static rendered_line_t *render_msg(
 /* ========== DRAW MSG WINDOW (с авто-прокруткой) ========== */
 
 /*
- * draw_msg_win() рендерит историю чата и автоматически подкручивает
- * msg_scroll_offset так, чтобы selected_idx (если >=0) был виден.
- * При selected_idx == -1 просто показывает хвост истории.
+ * draw_msg_win – главная функция отрисовки окна сообщений.
+ *
+ * Рендерит историю чата в память, вычисляет правильное смещение скролла,
+ * чтобы выделенное сообщение было видно (предпочитает верхнюю четверть окна),
+ * и выводит только видимые строки.
  */
 static void draw_msg_win(const char *chat_name,
                          char **senders, char **bodies,
@@ -558,7 +644,6 @@ static void draw_msg_win(const char *chat_name,
     int              *all_counts = malloc(count * sizeof(int));
     int total_lines = 0;
 
-    /* временный указатель для server_id_to_local */
     chat_entry_t *chat = (active_chat_idx >= 0) ? &chat_list[active_chat_idx] : NULL;
 
     for (int i = 0; i < count; i++) {
@@ -585,11 +670,10 @@ static void draw_msg_win(const char *chat_name,
         total_lines  += lc;
     }
 
-    /* 2. Вычисляем отступы, чтобы выделенное сообщение было видно */
+    /* 2. Вычисляем смещение скролла */
     int avail = msg_win_h - 2;        /* строки внутри рамки */
     if (avail < 1) avail = 1;
 
-    /* Считаем, сколько строк от начала истории до начала выбранного сообщения */
     int lines_before_selected = 0;
     if (selected_idx >= 0 && selected_idx < count) {
         for (int i = 0; i < selected_idx; i++)
@@ -599,21 +683,15 @@ static void draw_msg_win(const char *chat_name,
     int selected_height = (selected_idx >= 0 && selected_idx < count)
                           ? all_counts[selected_idx] : 0;
 
-    /* Ищем “идеальный” offset:
-     * Хотим, чтобы первая строка выделенного сообщения была в верхней четверти окна
-     * (target_line = avail / 4), но не даём offset стать отрицательным и не
-     * залезаем выше начала истории.
-     */
-    int target_line = avail / 4;          /* ≈25% от верха */
-    int ideal_end_line = lines_before_selected + selected_height + target_line;
+    /* Желаемое положение: первая строка выделенного сообщения в верхней четверти окна */
+    int target_line = avail / 4;
+    msg_scroll_offset = total_lines - avail - (lines_before_selected - target_line);
+    if (msg_scroll_offset < 0) msg_scroll_offset = 0;
     int max_offset = total_lines - avail;
     if (max_offset < 0) max_offset = 0;
-    msg_scroll_offset = total_lines - avail - (lines_before_selected - target_line);
-    /* Приводим к допустимым границам */
-    if (msg_scroll_offset < 0) msg_scroll_offset = 0;
     if (msg_scroll_offset > max_offset) msg_scroll_offset = max_offset;
 
-    /* Если выделение сброшено (selected_idx == -1), просто показываем конец */
+    /* Если выделение сброшено – показываем конец */
     if (selected_idx < 0) msg_scroll_offset = 0;
 
     int start_line = total_lines - avail - msg_scroll_offset;
@@ -624,7 +702,7 @@ static void draw_msg_win(const char *chat_name,
     box(msg_win, 0, 0);
     mvwprintw(msg_win, 0, 1, "Чат: %s", chat_name);
 
-    /* Индикатор скролла */
+    /* Индикатор скролла (если не в конце) */
     if (msg_scroll_offset > 0) {
         wattron(msg_win, COLOR_PAIR(COLOR_INFO));
         mvwprintw(msg_win, 0, msg_win_w - 14, "[^ +%d стр.]", msg_scroll_offset);
@@ -668,7 +746,7 @@ static void draw_msg_win(const char *chat_name,
 
     wrefresh(msg_win);
 
-    /* Освобождаем память */
+    /* Освобождаем память, выделенную render_msg */
     for (int i = 0; i < count; i++) free(all_lines[i]);
     free(all_lines);
     free(all_counts);
@@ -676,6 +754,10 @@ static void draw_msg_win(const char *chat_name,
 
 /* ========== LOAD & DISPLAY HISTORY ========== */
 
+/*
+ * load_chat_history – загружает сообщения активного чата из локальной БД
+ * и вызывает draw_msg_win для отображения.
+ */
 static void load_chat_history(int chat_id) {
     if (active_chat_idx < 0) return;
     chat_entry_t *chat = &chat_list[active_chat_idx];
@@ -701,6 +783,14 @@ static void load_chat_history(int chat_id) {
 
 /* ========== MAIN INPUT LOOP ========== */
 
+/*
+ * process_input – главный цикл клиента.
+ *
+ * Работает, пока connected == 1. На каждой итерации:
+ *   1. select() ждёт событий на сокете или stdin (таймаут 50 мс).
+ *   2. Обрабатывает все накопившиеся в очереди входящие сообщения (разбор протокола).
+ *   3. Читает и обрабатывает клавиши (ввод текста, команды, навигация).
+ */
 void process_input(void) {
     if (active_chat_idx >= 0)
         load_chat_history(chat_list[active_chat_idx].chat_id);
@@ -710,7 +800,7 @@ void process_input(void) {
         FD_ZERO(&rfds);
         FD_SET(sockfd, &rfds);
         FD_SET(STDIN_FILENO, &rfds);
-        struct timeval tv = {0, 50000};
+        struct timeval tv = {0, 50000};   /* 50 мс – достаточно для отзывчивости */
         int maxfd = (sockfd > STDIN_FILENO) ? sockfd : STDIN_FILENO;
 
         int ready = select(maxfd + 1, &rfds, NULL, NULL, &tv);
@@ -727,6 +817,7 @@ void process_input(void) {
             in_queue.count--;
             pthread_mutex_unlock(&in_queue.mutex);
 
+            /* разбор протокола – аналогично серверу */
             char cmd[MAX_CMD_LEN];
             get_cmd(msg, cmd, sizeof(cmd));
 
@@ -867,21 +958,21 @@ void process_input(void) {
         if (FD_ISSET(STDIN_FILENO, &rfds)) {
             wint_t wch;
             while (1) {
-                int ret = wget_wch(input_win, &wch);
+                int ret = wget_wch(input_win, &wch);   /* чтение одного широкого символа */
                 if (ret == ERR) break;
 
-                if (ret == KEY_CODE_YES) {
+                if (ret == KEY_CODE_YES) {             /* специальные клавиши */
                     if (wch == KEY_F(1)) {
                         connected = 0; break;
                     } else if (wch == KEY_UP) {
                         if (input_mode == MODE_NORMAL) move_selection(-1);
                     } else if (wch == KEY_DOWN) {
                         if (input_mode == MODE_NORMAL) move_selection(1);
-                    } else if (wch == KEY_PPAGE) {        /* Page Up */
+                    } else if (wch == KEY_PPAGE) {        /* Page Up – скролл вверх */
                         msg_scroll_offset += (msg_win_h - 3);
                         if (active_chat_idx >= 0)
                             load_chat_history(chat_list[active_chat_idx].chat_id);
-                    } else if (wch == KEY_NPAGE) {        /* Page Down */
+                    } else if (wch == KEY_NPAGE) {        /* Page Down – скролл вниз */
                         msg_scroll_offset -= (msg_win_h - 3);
                         if (msg_scroll_offset < 0) msg_scroll_offset = 0;
                         if (active_chat_idx >= 0)
@@ -893,7 +984,7 @@ void process_input(void) {
                     continue;
                 }
 
-                /* Ctrl+U / Ctrl+D — дополнительная прокрутка */
+                /* Ctrl+U / Ctrl+D – дополнительная прокрутка */
                 if (wch == 21) {           /* Ctrl+U */
                     msg_scroll_offset += (msg_win_h - 3);
                     if (active_chat_idx >= 0)
@@ -909,6 +1000,7 @@ void process_input(void) {
                 }
 
                 if (wch == L'\n') {
+                    /* Enter в режиме выбора чата для forward – подтверждаем выбор */
                     if (input_mode == MODE_FWD_SELECT_CHAT) {
                         strncpy(pending_fwd_user, chat_list[fwd_candidate_idx].name, MAX_LOGIN - 1);
                         input_mode = MODE_FWD_TEXT;
@@ -919,6 +1011,7 @@ void process_input(void) {
                         continue;
                     }
 
+                    /* Enter при наличии текста или в специальных режимах */
                     if (input_len > 0 || input_mode == MODE_REPLY || input_mode == MODE_FWD_TEXT) {
                         char mb_text[MAX_BODY] = {0};
                         for (int i = 0; i < input_len; i++) {
@@ -928,6 +1021,7 @@ void process_input(void) {
                         }
 
                         if (input_mode == MODE_REPLY) {
+                            /* отправка ответа */
                             char clean_text[MAX_BODY];
                             sanitize_body(clean_text, mb_text, sizeof(clean_text));
                             if (active_chat_idx >= 0 && chat_list[active_chat_idx].is_group) {
@@ -949,7 +1043,6 @@ void process_input(void) {
                                 local_db_save_msg(chat_list[active_chat_idx].chat_id,
                                                   my_login, -1, clean_text, pending_reply_srv_id, -1);
                             }
-                            /* скролл в конец, выделяем последнее */
                             if (active_chat_idx >= 0) {
                                 chat_list[active_chat_idx].selected_msg_idx =
                                     chat_list[active_chat_idx].msg_count;
@@ -960,6 +1053,7 @@ void process_input(void) {
                             pending_reply_srv_id = pending_reply_local = 0;
 
                         } else if (input_mode == MODE_FWD_TEXT) {
+                            /* отправка пересылаемого сообщения */
                             char comment_text[MAX_BODY];
                             sanitize_body(comment_text, mb_text, sizeof(comment_text));
                             int dest_idx = -1;
@@ -1012,6 +1106,7 @@ void process_input(void) {
                         } else if (mb_text[0] == '/') {
                             process_command(mb_text);
                         } else if (active_chat_idx >= 0) {
+                            /* обычное сообщение */
                             chat_entry_t *chat = &chat_list[active_chat_idx];
                             char clean_text[MAX_BODY];
                             sanitize_body(clean_text, mb_text, sizeof(clean_text));
@@ -1034,7 +1129,7 @@ void process_input(void) {
                     display_input_line();
                     redraw_all();
 
-                } else if (wch == 18) {           /* Ctrl+R */
+                } else if (wch == 18) {           /* Ctrl+R – начать ответ */
                     if (active_chat_idx >= 0 && chat_list[active_chat_idx].selected_msg_idx >= 0) {
                         chat_entry_t *chat = &chat_list[active_chat_idx];
                         pending_reply_srv_id = chat->server_msg_ids[chat->selected_msg_idx];
@@ -1045,7 +1140,7 @@ void process_input(void) {
                         display_input_line();
                         redraw_all();
                     }
-                } else if (wch == 6) {            /* Ctrl+F */
+                } else if (wch == 6) {            /* Ctrl+F – начать пересылку */
                     if (active_chat_idx >= 0 && chat_list[active_chat_idx].selected_msg_idx >= 0) {
                         chat_entry_t *chat = &chat_list[active_chat_idx];
                         pending_fwd_srv_id = chat->server_msg_ids[chat->selected_msg_idx];
@@ -1067,6 +1162,7 @@ void process_input(void) {
                         redraw_all();
                     }
                 } else if (wch == L'\t') {
+                    /* Tab – в обычном режиме переключает чаты, в режиме forward – чат-кандидат */
                     if (input_mode == MODE_FWD_SELECT_CHAT) {
                         if (chat_count > 1) {
                             fwd_candidate_idx = (fwd_candidate_idx + 1) % chat_count;
@@ -1082,6 +1178,7 @@ void process_input(void) {
                         redraw_all();
                     }
                 } else if (wch >= 32 && input_len < MAX_BODY - 1) {
+                    /* печатный символ – добавляем в буфер */
                     input_buf[input_len++] = wch;
                     input_buf[input_len]   = L'\0';
                     display_input_line();
